@@ -31,6 +31,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .merge(crate::mac::routes())
         .merge(crate::secrets::routes())
         .merge(crate::session::thread::routes())
+        .merge(crate::session::relay::routes())
         .route("/v1/health", get(health))
         .route("/v1/ready", get(ready))
         .route("/v1/capabilities", get(capabilities))
@@ -555,6 +556,9 @@ impl IntoResponse for session::Error {
             "storage unsafe; new execution is blocked" => "storage_blocked",
             "service is stopping" => "service_stopping",
             "service is draining" => "service_draining",
+            "this thread was asleep and is waking up; try again in a few seconds" => {
+                "session_waking"
+            }
             "model catalog unavailable" => "model_catalog_unavailable",
             "connect Codex before starting cloud work" => "codex_auth_required",
             "connect Claude Code before starting cloud work" => "claude_auth_required",
@@ -593,6 +597,8 @@ struct Start {
     system_prompt: Option<String>,
     /// Starts a child thread in this parent's folder; it inherits the parent's settings.
     parent_session: Option<String>,
+    /// The app's parent thread in another sandbox, which this session reports its turns to (relay.rs).
+    parent_thread: Option<String>,
     prompt: Option<String>,
     title: Option<String>,
     /// Starts a side chat on a copy of this session's conversation; it inherits the source's settings.
@@ -832,6 +838,7 @@ async fn start(
             || body.command_guard_enabled.is_some()
             || body.strip_ai_co_authors.is_some()
             || body.system_prompt.is_some()
+            || body.parent_thread.is_some()
         {
             return Err(session::Error::Conflict(
                 "a side chat takes only harness and fork",
@@ -851,6 +858,7 @@ async fn start(
             || body.command_guard_enabled.is_some()
             || body.strip_ai_co_authors.is_some()
             || body.system_prompt.is_some()
+            || body.parent_thread.is_some()
             || title.as_ref().is_some_and(|t| {
                 t.is_empty() || t.chars().count() > 200 || t.chars().any(char::is_control)
             })
@@ -868,6 +876,7 @@ async fn start(
             reasoning: body.reasoning,
             title,
             prompt,
+            service_tier: None,
         };
         let (id, receipt) = manager
             .spawn_child(&parent, &body.request_id, spawn)
@@ -891,6 +900,7 @@ async fn start(
                 body.command_guard_enabled,
                 body.strip_ai_co_authors,
                 body.system_prompt,
+                body.parent_thread,
             ),
         )
         .await?;

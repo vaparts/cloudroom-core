@@ -175,8 +175,14 @@ fn validate(manifest: &Manifest) -> Result<()> {
         if (entry.symlink && entry.kind != "project")
             || !matches!(
                 entry.kind.as_str(),
-                "native" | "context" | "project" | "attachment"
+                "native" | "lineage" | "context" | "project" | "attachment"
             )
+            // A Codex fork's parent conversation files, installed byte-for-byte beside it.
+            || (entry.kind == "lineage"
+                && (manifest.harness != runtime::Kind::Codex
+                    || entry.path.contains('/')
+                    || !entry.path.starts_with("rollout-")
+                    || !entry.path.ends_with(".jsonl")))
             || entry.size > 4 * 1024 * 1024 * 1024
             || (!(entry.sha256.is_empty()
                 && matches!(entry.kind.as_str(), "project" | "attachment"))
@@ -579,7 +585,7 @@ impl Manager {
                     "native conversation already belongs to a cloud session",
                 ));
             }
-            let native = if entry.kind == "native" {
+            let native = if matches!(entry.kind.as_str(), "native" | "lineage") {
                 Some((
                     self.config
                         .harnesses
@@ -782,7 +788,8 @@ impl Manager {
             return Err(Error::Conflict("transfer cancelled"));
         }
         if transfer.manifest.files.iter().enumerate().any(|(i, e)| {
-            matches!(e.kind.as_str(), "native" | "context") && !transfer.files.contains_key(&i)
+            matches!(e.kind.as_str(), "native" | "lineage" | "context")
+                && !transfer.files.contains_key(&i)
         }) {
             return Err(Error::Conflict("session text is still uploading"));
         }
@@ -835,7 +842,7 @@ impl Manager {
     async fn teleport_prompts(&self, transfer: &Transfer) -> Result<Vec<Receipt>> {
         let manifest = &transfer.manifest;
         let id = &manifest.request_id;
-        let index: Vec<_> = manifest.files.iter().filter(|entry| entry.kind != "native").map(|entry| json!({
+        let index: Vec<_> = manifest.files.iter().filter(|entry| !matches!(entry.kind.as_str(), "native" | "lineage")).map(|entry| json!({
             "source":entry.origin.as_deref().unwrap_or(&entry.path),"kind":entry.kind,"symlink":entry.symlink,
             "path":workspace::transfer_destination(&transfer.workspace,id,entry),"size_hint":entry.size,
         })).collect();

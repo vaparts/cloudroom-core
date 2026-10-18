@@ -9,6 +9,7 @@ mod catalog;
 mod guard;
 pub(crate) mod history;
 mod prompt;
+pub(crate) mod relay;
 pub mod report;
 mod sleep;
 mod state;
@@ -69,6 +70,15 @@ pub struct Receipt {
     pub error: Option<String>,
 }
 
+/// A start's provider, command guard, co-author stripping, system prompt and parent thread in another sandbox.
+type StartOptions = (
+    Option<String>,
+    Option<bool>,
+    Option<bool>,
+    Option<String>,
+    Option<String>,
+);
+
 #[derive(Default, Clone, Serialize, Deserialize)]
 pub struct Session {
     pub session_id: String,
@@ -111,6 +121,12 @@ pub struct Session {
     // Archived by `room-cli thread archive`; `thread list` hides it unless asked.
     #[serde(default)]
     pub archived: bool,
+    // Turns already reported to the parent in another sandbox (relay.rs).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub reported: std::collections::BTreeSet<String>,
+    // What this parent last heard of each child in its own sandbox, by thread ID (relay.rs).
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub child_states: BTreeMap<String, String>,
     pub reasoning: Option<String>,
     pub workspace: Option<crate::workspace::Workspace>,
     #[serde(skip)]
@@ -189,6 +205,14 @@ impl Session {
             .find(|r| r.command == "start")
             .and_then(|r| r.input["system_prompt"].as_str())
             .map(str::to_owned)
+    }
+
+    /// The app's thread this session reports its turns to, when that parent runs in another sandbox (relay.rs).
+    fn parent_thread(&self) -> Option<&str> {
+        self.receipts
+            .values()
+            .find(|r| r.command == "start")
+            .and_then(|r| r.input["parent_thread"].as_str())
     }
 
     fn resume(&self) -> Option<runtime::Resume> {
@@ -643,6 +667,7 @@ impl Manager {
             runtime::Kind::Fx => runtime::PI_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::Hermes => runtime::HERMES_REASONING_LEVELS.contains(&reasoning),
+            runtime::Kind::Devin => runtime::DEVIN_REASONING_LEVELS.contains(&reasoning),
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));
@@ -657,12 +682,7 @@ impl Manager {
         model: Option<String>,
         reasoning: Option<String>,
         (workspace, workspace_name): (Option<String>, Option<String>),
-        (provider, command_guard_enabled, strip_ai_co_authors, system_prompt): (
-            Option<String>,
-            Option<bool>,
-            Option<bool>,
-            Option<String>,
-        ),
+        (provider, command_guard_enabled, strip_ai_co_authors, system_prompt, parent_thread): StartOptions,
     ) -> Result<(String, Receipt)> {
         let id = format!("cr_{request}");
         let kind = harness
@@ -688,6 +708,12 @@ impl Manager {
         }
         if let Some(system_prompt) = &system_prompt {
             input["system_prompt"] = json!(system_prompt);
+        }
+        if let Some(parent) = &parent_thread {
+            if !relay::thread_id(parent) {
+                return Err(Error::Conflict("invalid parent_thread"));
+            }
+            input["parent_thread"] = json!(parent);
         }
         if let Some(model) = &model {
             input["model"] = json!(model);
@@ -997,8 +1023,13 @@ impl Manager {
             if local.draining && !matches!(command, "interrupt" | "close" | "stop" | "cancel") {
                 return Err(Error::Conflict("service is draining"));
             }
-            if matches!(command, "compact" | "rewind" | "goal") && session.state == "sleeping" {
-                self.schedule_resume(&mut local, id, false)?;
+            // The app retries this answer until the harness is back.
+            if matches!(command, "compact" | "rewind" | "goal")
+                && matches!(session.state.as_str(), "sleeping" | "resuming")
+            {
+                if session.state == "sleeping" {
+                    self.schedule_resume(&mut local, id, false)?;
+                }
                 return Err(Error::Conflict(
                     "this thread was asleep and is waking up; try again in a few seconds",
                 ));
@@ -1750,6 +1781,7 @@ impl Manager {
             }
         }
         self.watch_children(&local);
+        self.watch_reports(&local);
         Ok(())
     }
 
@@ -2090,7 +2122,10 @@ impl Manager {
                     if let Some(request) = local.sessions[id].current_request.clone() {
                         local.finish_receipt_with(id, &request, &status, error)?;
                         let session = local.sessions.get_mut(id).ok_or(Error::NotFound)?;
-                        if status == "completed" && session.parent_session.is_some() {
+                        if status == "completed"
+                            && (session.parent_session.is_some()
+                                || session.parent_thread().is_some())
+                        {
                             let text = handle.seen_text().chars().take(32768).collect();
                             session.replies.push((request, text));
                             session
@@ -2140,7 +2175,11 @@ impl Manager {
                 let resumable = cleaned_up
                     && ((session.ready && session.can_resume())
                         || (self.is_stopping() && restoring));
-                let recover = resumable && !self.is_stopping() && !session.recovery_attempted;
+                // An archived thread that crashes stays down: nothing waits for it (feedback #614).
+                let recover = resumable
+                    && !self.is_stopping()
+                    && !session.recovery_attempted
+                    && !session.archived;
                 // Launch already recorded the real cause; stopping its harness must not hide it.
                 let failed = session
                     .failure

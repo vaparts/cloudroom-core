@@ -1,8 +1,9 @@
 //! Cloud agents rename or archive their own thread, change its effort, and start, stop and archive child threads in their own sandbox. Each request
 //! is a session record, so the app applies it whenever it next reads the thread, including after it was offline.
-//! A child gets a sandbox of its own by default (ADR 0229). The app starts and reaches it, so Core records the
-//! request and waits briefly for the app's answer; without one, the child starts in this sandbox instead.
-use super::Manager;
+//! A child gets a sandbox of its own by default (ADR 0229). The app starts it, so Core records the request and
+//! waits briefly for the app's answer; without one, the child starts in this sandbox instead. Once started, the
+//! website carries its `tell`, `stop`, `archive` and turn reports, even while the app is closed (relay.rs).
+use super::{Manager, relay};
 use crate::preview::Peer;
 use axum::{
     Json, Router,
@@ -24,20 +25,18 @@ const USAGE: &str = "room-cli thread update --self --title TITLE
 room-cli thread update --self --reasoning-level LEVEL
 room-cli thread archive --self
 room-cli thread stop --self
-room-cli thread spawn --provider codex|claude-code|pi|opencode|hermes [--model MODEL] [--reasoning-level LEVEL] [--title TITLE] [--shared-sandbox] --prompt TEXT|--prompt-file PATH
+room-cli thread spawn --provider codex|claude-code|pi|opencode|hermes|devin [--model MODEL] [--reasoning-level LEVEL] [--service-tier default|fast] [--title TITLE] [--shared-sandbox] --prompt TEXT|--prompt-file PATH
 room-cli thread list [--include-archived]
-room-cli thread output CHILD_ID
+room-cli thread output CHILD_ID [--all]
 room-cli thread tell CHILD_ID TEXT
 room-cli thread stop CHILD_ID
 room-cli thread archive CHILD_ID";
 const SPAWN_NOTE: &str = "Started in this sandbox and folder. Keep working: Cloudroom sends you a message each time it finishes a turn.";
 const OWN_NOTE: &str = "Started in its own sandbox with a copy of your code (commits and uncommitted changes), on its own branch. It doesn't see your later edits; share work through Git. Use this ID with tell, stop and archive. Keep working: Cloudroom sends you a message each time it finishes a turn.";
 const FALLBACK_NOTE: &str = " The user's Cloudroom app didn't start it in its own sandbox (it's probably closed), so it runs here.";
-const OWN_COMMAND_NOTE: &str =
-    "Passed to the user's Cloudroom app, which applies it while it is open.";
 /// How long a spawn waits for the app to start the child in its own sandbox, and how long after a miss spawns
 /// share this sandbox right away, so a closed app costs one wait, not one per child.
-const APP_WAIT: Duration = Duration::from_secs(15);
+const APP_WAIT: Duration = Duration::from_secs(60);
 const APP_MISSED_FOR: Duration = Duration::from_secs(300);
 /// How long a child request's outcome is remembered, so a retried spawn or a repeated app answer gets the same one.
 const OUTCOME_KEPT: Duration = Duration::from_secs(3600);
@@ -74,6 +73,7 @@ pub struct SpawnBody {
     /// Run the child in this sandbox and folder instead of a sandbox of its own (ADR 0229).
     #[serde(default)]
     shared: bool,
+    service_tier: Option<String>,
 }
 
 /// The app's answer to a child request: the child thread it started, or why it could not.
@@ -137,7 +137,12 @@ pub(crate) fn fail(status: StatusCode, error: &str) -> Failure {
     (status, Json(json!({"error":error})))
 }
 
-fn record(m: &Manager, session: &str, kind: &str, data: Value) -> Result<Json<Value>, Failure> {
+pub(super) fn record(
+    m: &Manager,
+    session: &str,
+    kind: &str,
+    data: Value,
+) -> Result<Json<Value>, Failure> {
     m.note(session, kind, data.clone()).map_err(|error| {
         fail(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -193,11 +198,9 @@ async fn archive(
 
 /// Stops and archives every thread under `id` now: the app archives them too, but never stops them,
 /// and it may be offline. An archived thread is stopped again, in case it still runs.
-fn archive_under(m: &Arc<Manager>, id: &str) -> Result<(), Failure> {
+pub(super) fn archive_under(m: &Arc<Manager>, id: &str) -> Result<(), Failure> {
     for (child, archived) in m.descendants(id) {
-        let request =
-            random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
-        let _ = m.command(&child, request, "stop", json!({}));
+        retire(m, &child)?;
         if !archived {
             let _ = record(m, &child, "archive", json!({"id":child,"archived":true}))?;
         }
@@ -205,7 +208,18 @@ fn archive_under(m: &Arc<Manager>, id: &str) -> Result<(), Failure> {
     Ok(())
 }
 
-fn session_failure(error: super::Error) -> Failure {
+/// Stops an archived thread's turn, and its agent exits once that turn settles. It frees its memory now, not after
+/// 30 idle minutes (feedback #614). A later message still resumes it.
+pub(super) fn retire(m: &Arc<Manager>, id: &str) -> Result<(), Failure> {
+    for command in ["stop", "sleep"] {
+        let request =
+            random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
+        let _ = m.command(id, request, command, json!({}));
+    }
+    Ok(())
+}
+
+pub(super) fn session_failure(error: super::Error) -> Failure {
     let status = match error {
         super::Error::NotFound => StatusCode::NOT_FOUND,
         super::Error::Conflict(_) => StatusCode::CONFLICT,
@@ -214,7 +228,7 @@ fn session_failure(error: super::Error) -> Failure {
     fail(status, &error.message())
 }
 
-fn random_key() -> io::Result<String> {
+pub(super) fn random_key() -> io::Result<String> {
     let mut bytes = [0u8; 12];
     std::fs::File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     Ok(bytes.iter().map(|b| format!("{b:02x}")).collect())
@@ -235,6 +249,13 @@ async fn spawn(
         return Err(bad("Use a title of 1-200 characters"));
     }
     if input
+        .service_tier
+        .as_deref()
+        .is_some_and(|t| t != "default" && t != "fast")
+    {
+        return Err(bad("Use --service-tier default or fast"));
+    }
+    if input
         .model
         .as_ref()
         .is_some_and(|m| m.is_empty() || m.len() > 256 || m.chars().any(char::is_control))
@@ -252,10 +273,32 @@ async fn spawn(
         .provider
         .as_deref()
         .map(|p| {
-            serde_json::from_value(json!(p))
-                .map_err(|_| bad("Use --provider codex, claude-code, pi, opencode or hermes"))
+            serde_json::from_value(json!(p)).map_err(|_| {
+                bad("Use --provider codex, claude-code, pi, opencode, hermes or devin")
+            })
         })
         .transpose()?;
+    // Only a Pi parent passes its own model on; Cloud's default Pi model may not work with the user's logins.
+    let pi_parent = m
+        .local
+        .lock()
+        .unwrap()
+        .sessions
+        .get(&parent)
+        .map(|p| p.harness)
+        == Some(crate::runtime::Kind::Pi);
+    if harness == Some(crate::runtime::Kind::Pi)
+        && !pi_parent
+        && !input
+            .model
+            .as_deref()
+            .and_then(|m| m.split_once('/'))
+            .is_some_and(|(p, n)| !p.is_empty() && !n.is_empty())
+    {
+        return Err(bad(
+            "Select a Pi provider and model: add --model provider/model, for example anthropic/claude-haiku-5-5",
+        ));
+    }
     let key = match input.request_id.clone() {
         Some(key) => key,
         None => random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?,
@@ -273,7 +316,14 @@ async fn spawn(
     let mut note = SPAWN_NOTE.to_owned();
     if !input.shared {
         match own_sandbox_child(&m, &parent, &key, &input).await? {
-            Some(thread) => return Ok(Json(json!({"id":thread,"note":OWN_NOTE}))),
+            Some(thread) => {
+                let _ = m.note(
+                    &parent,
+                    "child_state",
+                    json!({"child":thread,"state":"running"}),
+                );
+                return Ok(Json(json!({"id":thread,"note":OWN_NOTE})));
+            }
             None => note.push_str(FALLBACK_NOTE),
         }
     }
@@ -283,6 +333,7 @@ async fn spawn(
         reasoning: input.reasoning,
         title: input.title.map(|t| t.trim().to_owned()),
         prompt: input.prompt,
+        service_tier: input.service_tier,
     };
     let (id, receipt) = m
         .spawn_child(&parent, &key, spawn)
@@ -347,6 +398,7 @@ async fn own_sandbox_child(
         ("model", &input.model),
         ("reasoning", &input.reasoning),
         ("title", &input.title.as_ref().map(|t| t.trim().to_owned())),
+        ("service_tier", &input.service_tier),
     ] {
         if let Some(value) = value {
             data[name] = json!(value);
@@ -422,31 +474,6 @@ async fn answer_child(
     }
 }
 
-/// `tell`, `stop` and `archive` for a child in its own sandbox, named by its thread ID: the app passes them on.
-fn own_sandbox_command(
-    m: &Manager,
-    parent: &str,
-    id: &str,
-    action: &str,
-    text: Option<&str>,
-) -> Option<Result<Json<Value>, Failure>> {
-    let own = id.strip_prefix("thr_").is_some_and(|key| {
-        !key.is_empty()
-            && key.len() <= 60
-            && key
-                .bytes()
-                .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    });
-    own.then(|| {
-        let mut data = json!({"id":id,"action":action});
-        if let Some(text) = text {
-            data["text"] = json!(text);
-        }
-        record(m, parent, "child_command", data)
-            .map(|_| Json(json!({"id":id,"state":"requested","note":OWN_COMMAND_NOTE})))
-    })
-}
-
 #[derive(Deserialize)]
 struct ListQuery {
     #[serde(default)]
@@ -459,21 +486,37 @@ async fn list(
     Query(query): Query<ListQuery>,
 ) -> Result<Json<Value>, Failure> {
     let parent = caller(&m, peer, "thread list")?;
-    Ok(Json(
-        m.children(&parent, None, query.include_archived).await,
-    ))
+    let mut answer = m.children(&parent, None, query.include_archived).await;
+    relay::own_children(&m, &parent, query.include_archived, &mut answer).await;
+    Ok(Json(answer))
+}
+
+#[derive(Deserialize)]
+struct OutputQuery {
+    #[serde(default)]
+    all: bool,
 }
 
 async fn output(
     State(m): State<Arc<Manager>>,
     ConnectInfo(peer): ConnectInfo<Peer>,
     Path(id): Path<String>,
+    Query(query): Query<OutputQuery>,
 ) -> Result<Json<Value>, Failure> {
     let parent = caller(&m, peer, "thread output")?;
     if id.starts_with("thr_") {
-        return Ok(Json(
-            json!({"id":id,"note":"This child runs in its own sandbox. Its replies arrive as messages when its turns end."}),
-        ));
+        // A child in its own sandbox: its saved chat, through the website, which checks this thread started it (ADR 0256).
+        let Some(api) = &m.history.api else {
+            return Ok(Json(
+                json!({"id":id,"note":"This child runs in its own sandbox. Its replies arrive as messages when its turns end."}),
+            ));
+        };
+        let all = if query.all { "1" } else { "0" };
+        return api
+            .get("chat", &[("thread", &id), ("all", all)])
+            .await
+            .map(Json)
+            .map_err(|error| website_failure(error, "read the child's chat"));
     }
     m.own_child(&parent, &id).map_err(session_failure)?;
     Ok(Json(
@@ -491,16 +534,34 @@ async fn tell(
     if input.text.trim().is_empty() || input.text.len() > 32768 {
         return Err(fail(StatusCode::CONFLICT, "Use a message of 1-32768 bytes"));
     }
-    if let Some(answer) = own_sandbox_command(&m, &parent, &id, "tell", Some(&input.text)) {
-        return answer;
+    if relay::thread_id(&id) {
+        return relay::command(&m, &parent, &id, "tell", Some(&input.text)).await;
     }
     m.own_child(&parent, &id).map_err(session_failure)?;
     let request =
         random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
-    match steer(&m, &id, &format!("{request}_steer"), &input.text)
-        .await
-        .as_deref()
-    {
+    deliver(&m, &id, &request, &input.text).await
+}
+
+/// Sends a message into the session's running turn, or else queues it. A request already delivered stays as it is,
+/// so a retried relay never sends it twice.
+pub(super) async fn deliver(
+    m: &Arc<Manager>,
+    id: &str,
+    request: &str,
+    text: &str,
+) -> Result<Json<Value>, Failure> {
+    let steer_id = format!("{request}_steer");
+    if let Some(done) = m.receipt(id, request) {
+        return Ok(Json(json!({"id":id,"state":done.state})));
+    }
+    // A steer that failed falls back to the queue, even on a retry.
+    let steered = match m.receipt(id, &steer_id) {
+        Some(s) if s.state != "failed" => return Ok(Json(json!({"id":id,"state":s.state}))),
+        Some(_) => None,
+        None => steer(m, id, &steer_id, text).await,
+    };
+    match steered.as_deref() {
         Some("completed") => {
             return Ok(Json(
                 json!({"id":id,"state":"steered","note":"Sent into the child's running turn. Cloudroom tells you when that turn finishes."}),
@@ -514,11 +575,25 @@ async fn tell(
         None => {}
     }
     let receipt = m
-        .command(&id, request, "prompt", json!({"text":input.text}))
+        .command(id, request.to_owned(), "prompt", json!({"text":text}))
         .map_err(session_failure)?;
     Ok(Json(
         json!({"id":id,"state":receipt.state,"note":"Queued. Cloudroom tells you when the child finishes it."}),
     ))
+}
+
+/// A website call failed: its own refusal as is, or why it could not be reached.
+pub(super) fn website_failure(error: super::history::ApiError, what: &str) -> Failure {
+    match error {
+        super::history::ApiError::Status(status, message) => fail(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            &message,
+        ),
+        error => fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!("Could not {what}: {error}. Retry."),
+        ),
+    }
 }
 
 /// Sends a busy child the message in its running turn, as in Local threads, so it never waits
@@ -556,8 +631,8 @@ async fn stop_child(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Failure> {
     let parent = caller(&m, peer, "thread stop")?;
-    if let Some(answer) = own_sandbox_command(&m, &parent, &id, "stop", None) {
-        return answer;
+    if relay::thread_id(&id) {
+        return relay::command(&m, &parent, &id, "stop", None).await;
     }
     m.own_child(&parent, &id).map_err(session_failure)?;
     let request =
@@ -575,14 +650,12 @@ async fn archive_child(
     Path(id): Path<String>,
 ) -> Result<Json<Value>, Failure> {
     let parent = caller(&m, peer, "thread archive")?;
-    if let Some(answer) = own_sandbox_command(&m, &parent, &id, "archive", None) {
-        return answer;
+    if relay::thread_id(&id) {
+        return relay::command(&m, &parent, &id, "archive", None).await;
     }
     m.own_child(&parent, &id).map_err(session_failure)?;
-    let request =
-        random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?;
     // A child that already ended has nothing to stop. Stop it first, so it starts no new children.
-    let _ = m.command(&id, request, "stop", json!({}));
+    retire(&m, &id)?;
     archive_under(&m, &id)?;
     record(&m, &id, "archive", json!({"id":id,"archived":true}))
 }
@@ -595,7 +668,49 @@ fn flag<'a>(words: &[&'a str], name: &str) -> Option<&'a str> {
         .and_then(|i| words.get(i + 1).copied())
 }
 
+/// Flags `room-cli thread spawn` takes with a value. `--project` (this thread's own, from the agent instructions)
+/// and `--base-branch` (a Local habit: children copy this thread's code) are accepted and ignored.
+const SPAWN_VALUES: [&str; 12] = [
+    "--provider",
+    "--model",
+    "--reasoning-level",
+    "--service-tier",
+    "--title",
+    "--request-id",
+    "--prompt",
+    "--prompt-file",
+    "--machine",
+    "--host",
+    "--project",
+    "--base-branch",
+];
+
+/// The first word `room-cli thread spawn` would otherwise ignore, so nothing the agent asked for is silently dropped.
+fn unknown_spawn_word<'a>(words: &[&'a str]) -> Option<&'a str> {
+    let mut rest = words.iter();
+    while let Some(word) = rest.next() {
+        if SPAWN_VALUES.contains(word) {
+            rest.next();
+        } else if !matches!(*word, "--shared-sandbox" | "--parent-self") {
+            return Some(word);
+        }
+    }
+    None
+}
+
 async fn spawn_cli(words: &[&str]) -> io::Result<i32> {
+    if let Some(word) = unknown_spawn_word(words) {
+        eprintln!(
+            "Unknown option {word}. Cloud threads take only the options in `room-cli thread --help`."
+        );
+        return Ok(2);
+    }
+    // A child starts in this thread's project. Another project's ID would be silently ignored, so it is refused.
+    let own = std::env::var("ROOM_PROJECT_ID").unwrap_or_default();
+    if flag(words, "--project").is_some_and(|p| !p.is_empty() && p != own) {
+        eprintln!("Cloud children start in this thread's project. Omit --project.");
+        return Ok(2);
+    }
     // A child gets a sandbox of its own unless --shared-sandbox (ADR 0229); `--machine cloud` is a harmless Local habit.
     if flag(words, "--machine")
         .or(flag(words, "--host"))
@@ -619,6 +734,7 @@ async fn spawn_cli(words: &[&str]) -> io::Result<i32> {
         ("--provider", "provider"),
         ("--model", "model"),
         ("--reasoning-level", "reasoning"),
+        ("--service-tier", "service_tier"),
         ("--title", "title"),
         ("--request-id", "request_id"),
     ] {
@@ -656,10 +772,19 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
             println!("{answer}");
             return Ok(0);
         }
-        ["output", id] => {
-            let answer =
-                crate::mac::request(crate::mac::SOCKET, "GET", &format!("/children/{id}"), None)
-                    .await?;
+        ["output", id] | ["output", id, "--all"] | ["output", "--all", id] => {
+            let all = if words.contains(&"--all") {
+                "?all=true"
+            } else {
+                ""
+            };
+            let answer = crate::mac::request(
+                crate::mac::SOCKET,
+                "GET",
+                &format!("/children/{id}{all}"),
+                None,
+            )
+            .await?;
             println!("{answer}");
             return Ok(0);
         }

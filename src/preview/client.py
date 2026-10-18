@@ -16,6 +16,7 @@ from pathlib import Path
 import plistlib
 import pwd
 import select
+import shlex
 import signal
 import socket
 import ssl
@@ -452,7 +453,7 @@ class Tunnel:
         if self.process.poll() is not None or not self.socket_path.exists():
             return False
         try:
-            with contextlib.closing(http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=2)) as connection:
+            with contextlib.closing(http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=10)) as connection:
                 connection.request('HEAD', '/', headers={'Host': self.server.authority})
                 response = connection.getresponse()
                 return response.getheader('X-Cloudroom-Preview') == self.generation
@@ -499,9 +500,18 @@ READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
              ' (literal "/usr/bin/automator") (literal "/bin/launchctl") (literal "/usr/bin/tccutil") (literal "/usr/bin/defaults"))')
 ASK = '''on run argv
 activate
-display dialog (item 1 of argv) with title "Cloudroom" buttons {"Deny", "Allow for this thread", "Allow"} default button "Allow" cancel button "Deny" with icon caution giving up after 300
+display dialog (item 1 of argv) with title "Cloudroom" buttons {"Allow", "Allow for this thread", "Deny"} default button "Deny" cancel button "Deny" with icon caution giving up after 300
 return button returned of result
 end run'''
+
+
+def visible(text, chars, lines):
+    """The part of `text` the Ask first popup shows, and how many characters it leaves out."""
+    text = text.rstrip()
+    shown = ''.join(text[:chars].splitlines(keepends=True)[:lines]).rstrip()
+    return shown, len(text) - len(shown)
+
+
 # Hex characters per result request: some sandbox proxies drop requests over about 8 MB,
 # and each part must upload within MAC_POST_SECONDS on a slow home connection.
 MAC_PART = 1024 * 1024
@@ -574,6 +584,8 @@ class MacJobs:
     """Mac access (ADR 0113, levels in ADR 0186): run commands from the user's cloud agents as this user, only while enabled."""
     def __init__(self, folder):
         self.folder, self.running, self.lock = folder, {}, threading.Lock()
+        # Jobs the agent stopped before they started; execute skips them.
+        self.cancelled = set()
         # Ask first: one dialog at a time; "Allow for this thread" trusts that sandbox's core until the helper restarts.
         self.asking, self.trusted = threading.Lock(), set()
 
@@ -585,9 +597,26 @@ class MacJobs:
         with self.asking:
             if core.key in self.trusted:
                 return True
-            text = f"A cloud agent wants to change your Mac.\n\nFolder: {job.get('cwd') or '~'}\n\n{job['command'][:600]}"
-            process = subprocess.Popen(['/usr/bin/osascript', '-e', ASK, text], stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
-                                       start_new_session=True)
+            # Show what will run, including a script sent as input. Hidden parts still run: warn above them, where
+            # padding cannot push the warning out of view. Return always denies.
+            command, hidden = visible(job['command'], 600, 10)
+            warnings = f"Warning: {hidden:,} more characters of this command are not shown, and will also run.\n\n" if hidden else ''
+            text = f"Folder: {job.get('cwd') or '~'}\nCommand: {command}"
+            if job.get('stdin'):
+                try:
+                    data = bytes.fromhex(job['stdin']).decode()
+                    if '\0' in data:
+                        raise ValueError('binary input')
+                    script, hidden = visible(data, 1000, 20)
+                    count = len(data.rstrip().splitlines())
+                    text += f"\n\nInput ({count:,} line{'s' if count != 1 else ''}{', all shown' if not hidden else ''}):\n\n{script}"
+                    if hidden:
+                        warnings += f"Warning: {hidden:,} more characters of its input are not shown, and will also run.\n\n"
+                except ValueError:  # Not text, such as the archive a push unpacks.
+                    warnings += f"Warning: the command also reads {len(job['stdin']) // 2:,} bytes of input that cannot be shown.\n\n"
+            text = f"A cloud agent wants to change your Mac.\n\n{warnings}{text}"
+            process = subprocess.Popen(['/usr/bin/osascript', '-e', ASK, text], stdout=subprocess.PIPE,
+                                       stderr=subprocess.DEVNULL, text=True, start_new_session=True)
             with self.lock:
                 self.running[job['id']] = process
             answer = process.communicate()[0].strip()
@@ -654,34 +683,48 @@ class MacJobs:
             time.sleep(delay)
 
     def execute(self, core, device, job):
-        def post(body):
+        def post(body, timeout=MAC_POST_SECONDS):
             core.fetch(core.url + '/v1/mac/results/' + urllib.parse.quote(job['id']), {'device': device, **body}, None, core.headers,
-                       MAC_POST_SECONDS)
+                       timeout)
         with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
             review(core, job, mac_level(self.enabled() or {}))
-        try:
-            post({'state': 'running'})
-        except ControlError as error:
-            if error.code in (401, 403, 404, 409):
-                return  # Core already gave up on this job and told the agent it did not run.
-        except (OSError, ValueError):
-            pass
+        # Run only once Core confirms it still wants the job. Core gives up on an unconfirmed job after about 10 s and tells
+        # the agent it did not run, so running it anyway could change the Mac twice when the agent retries.
+        confirmed, deadline = False, time.monotonic() + 30
+        while not confirmed and time.monotonic() < deadline:
+            try:
+                post({'state': 'running'}, 10)
+                confirmed = True
+            except ControlError as error:
+                if error.code in (401, 403, 404, 409):
+                    return  # Core already gave up on this job and told the agent it did not run.
+                time.sleep(1)
+            except (OSError, ValueError):
+                time.sleep(1)
         result = {'state': 'done', 'code': 127, 'stdout': '', 'stderr': '', 'truncated': False}
-        refused = self.refusal(core, job)
+        # Core may have taken a confirmation whose reply was lost, so it still gets this result instead of waiting forever.
+        refused = self.refusal(core, job) if confirmed else 'The Mac could not confirm this command with the cloud, so it did not run. Try again.'
         sandboxed = not refused and not job.get('write') and mac_level(self.enabled() or {}) != 'full'
-        shell = [pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh', '-lc', job['command']]
+        login = pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh'
+        # Cloudroom's own tools (browser-harness) come first, as in Local threads, after the user's profile sets PATH.
+        tools = shlex.quote(str(Path(core.config['connectionFile']).parent / 'bin'))
+        path = f'set -gx PATH {tools} $PATH; ' if login.endswith('/fish') else f'PATH={tools}:"$PATH"; '
+        shell = [login, '-lc', path + job['command']]
         try:
             if refused:
                 raise PermissionError(refused)
             folder = Path.home() / os.path.expanduser(job.get('cwd') or '~')
-            process = subprocess.Popen(['/usr/bin/sandbox-exec', '-p', READ_ONLY, *shell] if sandboxed else shell, cwd=folder,
-                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+            with self.lock:  # A stop that arrives while the command starts either skips or kills it.
+                if job['id'] in self.cancelled:
+                    self.cancelled.discard(job['id'])
+                    raise PermissionError('The agent stopped this command before it started, so it did not run.')
+                process = subprocess.Popen(['/usr/bin/sandbox-exec', '-p', READ_ONLY, *shell] if sandboxed else shell, cwd=folder,
+                                           stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
+                self.running[job['id']] = process
         except OSError as error:
-            result['code'] = 126 if refused else 127
+            result['code'] = 126 if isinstance(error, PermissionError) else 127
             result['stderr'] = str(error).encode().hex()
         else:
-            with self.lock:
-                self.running[job['id']] = process
             output = {'stdout': bytearray(), 'stderr': bytearray()}
             def read(name):
                 for chunk in iter(lambda: getattr(process, name).read1(65536), b''):
@@ -720,6 +763,8 @@ class MacJobs:
     def cancel(self, job):
         with self.lock:
             process = self.running.get(job)
+            if not process:
+                self.cancelled.add(job)
         if process:
             def kill(signal_number):
                 with contextlib.suppress(ProcessLookupError, PermissionError):

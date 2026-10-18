@@ -323,7 +323,7 @@ impl Workspaces {
         };
         let request = serde_json::json!({"op":"teleport","tree":{"root":root,"create":true},
             "path":relative,"size":entry.size,"sha256":entry.sha256,"executable":entry.executable,"symlink":entry.symlink,
-            "project_path":(entry.kind == "project").then_some(&entry.path),
+            "project_path":(entry.kind == "project").then_some(&entry.path),"lineage":entry.kind == "lineage",
             "native":native.map(|(_,kind,native_id)| serde_json::json!({"harness":kind,"id":native_id,"cwd":workspace.path}))});
         let mut command = Command::new("python3");
         command

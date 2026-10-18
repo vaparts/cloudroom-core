@@ -86,8 +86,28 @@ impl Api {
         Err(ApiError::Status(status, message))
     }
 
+    pub async fn get(&self, path: &str, query: &[(&str, &str)]) -> Result<Value, ApiError> {
+        Self::send(self.call(Method::GET, path).query(query))
+            .await?
+            .json()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))
+    }
+
     pub async fn post(&self, path: &str, body: &Value) -> Result<Value, ApiError> {
         Self::send(self.call(Method::POST, path).json(body))
+            .await?
+            .json()
+            .await
+            .map_err(|e| ApiError::Network(e.to_string()))
+    }
+
+    /// A call that may wake another sandbox first, which can use the website's whole 60-second limit.
+    pub async fn post_waking(&self, path: &str, body: &Value) -> Result<Value, ApiError> {
+        let request = self
+            .call(Method::POST, path)
+            .timeout(Duration::from_secs(70));
+        Self::send(request.json(body))
             .await?
             .json()
             .await

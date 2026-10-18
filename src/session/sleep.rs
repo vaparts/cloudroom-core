@@ -85,7 +85,8 @@ impl Local {
             && s.close_request.is_none()
             && !s.interrupt_pending()
             && !s.storage_paused
-            && !background
+            // An archived thread asked to exit leaves its background jobs behind (thread.rs `retire`).
+            && (!background || (s.archived && s.sleep_pending()))
             && !self
                 .sessions
                 .values()
@@ -120,6 +121,9 @@ impl Manager {
         }
         if self.teleports.busy() {
             return json!({"drained":false,"reason":"transfer_running"});
+        }
+        if super::relay::report_pending(&local) {
+            return json!({"drained":false,"reason":"report_pending"});
         }
         local.draining = true;
         // The sandbox stops next, so its next start replays almost nothing.

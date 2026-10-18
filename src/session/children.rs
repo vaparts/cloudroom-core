@@ -137,14 +137,15 @@ impl Manager {
 }
 
 /// Harnesses a cloud agent may start as a child thread; the app has no Cloud thread type for the others.
-const CHILD_HARNESSES: [runtime::Kind; 5] = [
+const CHILD_HARNESSES: [runtime::Kind; 6] = [
     runtime::Kind::Codex,
     runtime::Kind::Claude,
     runtime::Kind::Pi,
     runtime::Kind::OpenCode,
     runtime::Kind::Hermes,
+    runtime::Kind::Devin,
 ];
-const FINISHED: [&str; 5] = [
+pub(super) const FINISHED: [&str; 5] = [
     "completed",
     "failed",
     "interrupted",
@@ -152,7 +153,7 @@ const FINISHED: [&str; 5] = [
     "unknown_after_restart",
 ];
 /// How much of a child's reply its parent's notice quotes, as for Local threads.
-const NOTICE_REPLY_CHARS: usize = 4000;
+pub(super) const NOTICE_REPLY_CHARS: usize = 4000;
 
 /// A child thread the parent does not wait for: `room-cli thread spawn`, or the app's API.
 pub struct Spawn {
@@ -161,6 +162,8 @@ pub struct Spawn {
     pub reasoning: Option<String>,
     pub title: Option<String>,
     pub prompt: String,
+    /// `fast` runs the child's turns in the harness's fast tier, where it has one.
+    pub service_tier: Option<String>,
 }
 
 /// A side chat's source (ADR 0189): `session`'s conversation, cut before user message `before`
@@ -237,9 +240,21 @@ pub(super) fn fork_history(
 }
 
 /// A notice's two delivery attempts: steered into the parent's running turn, then queued as a prompt.
-fn notice_ids(child: &str, request: &str) -> (String, String) {
-    let queued = format!("notice_{child}_{request}");
+/// Request IDs hold at most 64 characters, so a longer one becomes a stable FNV-1a hash.
+pub(super) fn notice_ids(child: &str, request: &str) -> (String, String) {
+    let mut queued = legacy_notice_id(child, request);
+    if queued.len() + "_steer".len() > 64 {
+        let hash = queued.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
+            (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3)
+        });
+        queued = format!("notice_{hash:016x}");
+    }
     (format!("{queued}_steer"), queued)
+}
+
+/// Core 0.1.57 and older never shortened it, so a notice they delivered is still found.
+fn legacy_notice_id(child: &str, request: &str) -> String {
+    format!("notice_{child}_{request}")
 }
 
 fn title(session: &Session) -> Option<String> {
@@ -251,7 +266,7 @@ fn title(session: &Session) -> Option<String> {
         .map(str::to_owned)
 }
 
-fn notice(
+pub(super) fn notice(
     child: &str,
     title: Option<String>,
     state: &str,
@@ -268,7 +283,7 @@ fn notice(
                 |r| {
                     let mut text: String = r.trim().chars().take(NOTICE_REPLY_CHARS).collect();
                     if r.trim().chars().count() > NOTICE_REPLY_CHARS {
-                        text.push_str("\n\n[... reply truncated ...]");
+                        text.push_str(&format!("\n\n[... reply truncated. Read all of it with `room-cli thread output {child}` ...]"));
                     }
                     text
                 },
@@ -314,7 +329,7 @@ impl Manager {
             let kind = spawn.harness.unwrap_or(p.harness);
             if !CHILD_HARNESSES.contains(&kind) {
                 return Err(Error::Conflict(
-                    "child threads support codex, claude-code, pi, opencode and hermes",
+                    "child threads support codex, claude-code, pi, opencode, hermes and devin",
                 ));
             }
             let same = kind == p.harness;
@@ -351,6 +366,12 @@ impl Manager {
             }
             if let Some(title) = &spawn.title {
                 input["title"] = json!(title);
+            }
+            if let Some(tier) = &spawn.service_tier {
+                if tier == "fast" && !kind.fast() {
+                    return Err(Error::Conflict("invalid service tier"));
+                }
+                input["service_tier"] = json!(tier);
             }
             if !p.command_guard_enabled() {
                 input["command_guard_enabled"] = json!(false);
@@ -625,15 +646,21 @@ impl Manager {
                             return None;
                         }
                         let (steer, queued) = notice_ids(&child, &r.request_id);
+                        let legacy = legacy_notice_id(&child, &r.request_id);
                         let tried = p.receipts.get(&steer);
+                        let steered = |s: &Receipt| {
+                            s.state == "completed"
+                                || (s.state == "accepted"
+                                    && s.input["target_request_id"].as_str()
+                                        == p.current_request.as_deref())
+                        };
                         // Delivered, or still being steered into the turn it targets.
                         let settled = p.receipts.contains_key(&queued)
-                            || tried.is_some_and(|s| {
-                                s.state == "completed"
-                                    || (s.state == "accepted"
-                                        && s.input["target_request_id"].as_str()
-                                            == p.current_request.as_deref())
-                            });
+                            || p.receipts.contains_key(&legacy)
+                            || tried.is_some_and(steered)
+                            || p.receipts
+                                .get(&format!("{legacy}_steer"))
+                                .is_some_and(steered);
                         (!settled).then(|| (r, tried.is_none()))
                     });
                     match finished {

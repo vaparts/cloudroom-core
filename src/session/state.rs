@@ -275,6 +275,8 @@ impl Local {
                     | "launch_reasoning"
                     | "native_identity"
                     | "native_history_unavailable"
+                    | "parent_report"
+                    | "child_state"
             )
         {
             session.last_activity = record.timestamp_ms.or(session.last_activity);
@@ -296,7 +298,11 @@ impl Local {
                         let task = Receipt {
                             request_id: receipt.request_id.replacen("child_", "task_", 1),
                             command: "prompt".into(),
-                            input: json!({"text":receipt.input["prompt"],"reasoning":receipt.input["reasoning"]}),
+                            input: if receipt.input["service_tier"].is_string() {
+                                json!({"text":receipt.input["prompt"],"reasoning":receipt.input["reasoning"],"service_tier":receipt.input["service_tier"]})
+                            } else {
+                                json!({"text":receipt.input["prompt"],"reasoning":receipt.input["reasoning"]})
+                            },
                             state: "accepted".into(),
                             model: None,
                             provider: None,
@@ -528,6 +534,20 @@ impl Local {
             }
             "archive" => session.archived = true,
             "detach" => session.parent_session = None,
+            "child_state" => {
+                if let (Some(child), Some(state)) =
+                    (record.data["child"].as_str(), record.data["state"].as_str())
+                {
+                    session
+                        .child_states
+                        .insert(child.to_owned(), state.to_owned());
+                }
+            }
+            "parent_report" => {
+                if let Some(request) = record.data["request_id"].as_str() {
+                    session.reported.insert(request.to_owned());
+                }
+            }
             "usage_limited" => session.usage_limited = true,
             "storage_warning" => session.storage_warned = true,
             "storage_pause" => session.storage_paused = record.data["paused"] == true,

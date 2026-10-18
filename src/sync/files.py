@@ -218,20 +218,22 @@ class Tree:
                 except FileNotFoundError:
                     pass
 
-    def known_rollout(self, native_id):
+    def known_rollout(self, native_id, filename=None):
         # Codex resumes a conversation it already knows only from that saved path.
         # Its dated folders win over teleport/ copies left by earlier failed transfers.
         found = []
         for folder, _, names in os.walk(self.root):
             for name in names:
-                if name.endswith(f'-{native_id}.jsonl'):
+                if name == filename if filename else name.endswith(f'-{native_id}.jsonl'):
                     relative = os.path.relpath(os.path.join(folder, name), self.root)
                     found.append((not relative.startswith('teleport/'), os.lstat(os.path.join(folder, name)).st_mtime, relative))
         return max(found)[2] if found else None
 
     def install_transfer(self, request, stream):
         native = request.get('native')
-        relative = (native and native['harness'] == 'codex' and self.known_rollout(native['id'])) or request['path']
+        # A Codex fork reads its parent conversations (lineage) at saved byte offsets, so they stay byte-for-byte.
+        lineage = request.get('lineage') and PurePosixPath(request['path']).name
+        relative = (native and native['harness'] == 'codex' and self.known_rollout(native['id'], lineage)) or request['path']
         digest = hashlib.sha256()
         count = 0
         with self.parent(relative, create=True) as (fd, name):
@@ -247,16 +249,23 @@ class Tree:
                         digest.update(line); count += len(line)
                         header = json.loads(line)
                         metadata = header if native['harness'] == 'pi' else header.get('payload', {})
-                        if metadata.get('id') != native['id']:
+                        expected = native['id']
+                        if lineage:
+                            owner = re.fullmatch(r'rollout-[0-9T-]{19}-([0-9a-f-]{36})(_[0-9a-f-]{36})?\.jsonl', lineage)
+                            expected = owner and owner[1]
+                        if not expected or metadata.get('id') != expected:
                             raise ValueError('native identity mismatch')
                         if native['harness'] == 'pi':
                             if header.get('type') != 'session' or header.get('version') != 3:
                                 raise ValueError('unsupported Pi session')
                         elif header.get('type') != 'session_meta':
                             raise ValueError('unsupported Codex session')
-                        metadata['cwd'] = native['cwd']
-                        metadata.pop('dynamic_tools', None)
-                        output.write((json.dumps(header, separators=(',', ':')) + '\n').encode())
+                        if lineage:
+                            output.write(line)
+                        else:
+                            metadata['cwd'] = native['cwd']
+                            metadata.pop('dynamic_tools', None)
+                            output.write((json.dumps(header, separators=(',', ':')) + '\n').encode())
                     while chunk := stream.read(CHUNK):
                         count += len(chunk)
                         if count > request['size']:
@@ -269,14 +278,18 @@ class Tree:
                 try:
                     os.link(temporary, name, src_dir_fd=fd, dst_dir_fd=fd, follow_symlinks=False)
                 except FileExistsError:
-                    def checksum(filename):
+                    def checksum(filename, limit=MAX_FILE_BYTES):
                         with os.fdopen(os.open(filename, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=fd), 'rb') as existing:
                             if not stat.S_ISREG(os.fstat(existing.fileno()).st_mode):
                                 raise ValueError('expected regular transfer file')
                             checksum = hashlib.sha256()
-                            while chunk := existing.read(CHUNK): checksum.update(chunk)
+                            while limit and (chunk := existing.read(min(CHUNK, limit))):
+                                checksum.update(chunk); limit -= len(chunk)
                             return checksum.digest()
-                    if checksum(name) != checksum(temporary):
+                    # A parent conversation that only grew since already holds every byte its forks read.
+                    if lineage and checksum(name, count) == digest.digest():
+                        pass
+                    elif checksum(name) != checksum(temporary):
                         if not native:
                             raise Conflict('transfer destination changed')
                         # A returning conversation replaces the VM's older copy, which stays beside it.
