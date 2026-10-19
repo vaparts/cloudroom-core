@@ -15,6 +15,7 @@ pub(super) const HERMES: cursor::Flavor = cursor::Flavor {
     // Hermes replays the whole conversation on `session/load`; Cloudroom already has it.
     replay: false,
     explain_stops: true,
+    empty_turn: None,
 };
 const DATABASE: &str = "state.db";
 /// The efforts Local threads offer for Hermes (provider-acp).

@@ -15,6 +15,7 @@ pub(super) const DEVIN: cursor::Flavor = cursor::Flavor {
     // Devin keeps the conversation itself; Cloudroom already has it.
     replay: false,
     explain_stops: true,
+    empty_turn: None,
 };
 const DATABASE: &str = "cli/sessions.db";
 /// The efforts Local threads offer for Devin (provider-acp); Devin applies them per model as `thought_level`.

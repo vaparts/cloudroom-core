@@ -14,6 +14,7 @@ pub(super) const OPENCODE: cursor::Flavor = cursor::Flavor {
     notices: &[],
     replay: true,
     explain_stops: true,
+    empty_turn: None,
 };
 const DATABASE: &str = "opencode.db";
 /// Cloudroom levels for OpenCode; each model offers its own subset of efforts.

@@ -10,9 +10,11 @@ use std::{
 };
 use tokio::process::Command;
 
+/// How long a selected skill waits for a new thread's project copy before the agent is told to look for it.
+const SKILL_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
 const INSTRUCTIONS: &str = "Cloudroom owns this cloud session. Ask clarifying questions in ordinary chat, not interactive tools. Start child threads with `room-cli thread spawn` (any harness and model; see `room-cli thread --help`); each gets its own sandbox with a copy of your code (add `--shared-sandbox` to run it in yours), shows under this thread, and Cloudroom messages you when it finishes. Do not use native subagents, workflows, or agent teams. Fast mode is unavailable. Rewinding changes conversation history only, never files.";
 
-fn uuid() -> io::Result<String> {
+pub(super) fn uuid() -> io::Result<String> {
     let mut bytes = [0u8; 16];
     File::open("/dev/urandom")?.read_exact(&mut bytes)?;
     bytes[6] = (bytes[6] & 15) | 64;
@@ -326,12 +328,17 @@ pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::R
             "Claude Fast mode is disabled",
         ));
     }
-    let reader = handle.clone();
-    let payload = input.clone();
-    let (text, warnings) =
+    let expand = || {
+        let reader = handle.clone();
+        let payload = input.clone();
         tokio::task::spawn_blocking(move || super::claude_skills::expand(&reader, &payload))
-            .await
-            .map_err(io::Error::other)??;
+    };
+    let (mut text, mut warnings) = expand().await.map_err(io::Error::other)??;
+    // A new thread's first message can arrive before its project lands, so a project skill can look missing.
+    if !warnings.is_empty() {
+        crate::workspace::files::settle(&handle.repository, SKILL_WAIT).await;
+        (text, warnings) = expand().await.map_err(io::Error::other)??;
+    }
     let mut settings = json!({"fastMode":false,"effortLevel":null});
     if let Some(reasoning) = input["reasoning"].as_str().or(handle.reasoning.as_deref()) {
         settings["effortLevel"] = if reasoning == "none" {

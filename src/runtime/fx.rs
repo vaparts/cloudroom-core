@@ -14,6 +14,7 @@ pub(super) const FX: cursor::Flavor = cursor::Flavor {
     notices: &["[context] ", "skill discovery warning: "],
     replay: false,
     explain_stops: true,
+    empty_turn: None,
 };
 
 pub(super) fn command(config: &Config, profile: &HarnessConfig) -> io::Result<Command> {
@@ -66,36 +67,63 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
         }
         "session/new"
     };
-    let (id, mut session) = cursor::attach(handle, "fx", method, params).await?;
+    let (id, session) = cursor::attach(handle, "fx", method, params).await?;
+    *handle.acp_config.lock().unwrap() = session;
     let requested = handle.profile.model.as_str();
     if requested != "default" {
-        if !offers(&session, "model", requested) {
+        if !offers(&handle.acp_config.lock().unwrap(), "model", requested) {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 format!("fx model {requested} is unavailable for this account"),
             ));
         }
-        session = set(handle, &id, "model", requested).await?;
+        set(handle, &id, "model", requested).await?;
     }
-    // Like Local threads, a model without this effort keeps fx's default (ADR 0133).
-    if let Some(effort) = handle.reasoning.as_deref()
-        && offers(&session, "effort", effort)
-        && cursor::option_value(&session, "effort") != Some(effort)
-    {
-        set(handle, &id, "effort", effort).await?;
-    }
+    prepare_turn(handle).await?;
     Ok(id)
+}
+
+/// Switches to the turn's effort. Like Local threads, a model without it keeps fx's default (ADR 0133).
+pub(super) async fn prepare_turn(handle: &Handle) -> io::Result<()> {
+    let Some(effort) = handle.reasoning.as_deref() else {
+        return Ok(());
+    };
+    let change = {
+        let state = handle.acp_config.lock().unwrap();
+        offers(&state, "effort", effort) && cursor::option_value(&state, "effort") != Some(effort)
+    };
+    if change {
+        set(handle, &handle.native()?, "effort", effort).await?;
+    }
+    Ok(())
 }
 
 pub(super) async fn send(handle: &Handle, request: &str, input: &Value) -> io::Result<()> {
     let id = handle.native()?;
-    cursor::prompt(
-        handle,
-        request,
-        input,
-        instructed(&handle.profile.home, &id),
-    )
-    .await
+    let images = images(handle, input).await?;
+    let instructed = instructed(&handle.profile.home, &id);
+    cursor::prompt(handle, request, input, instructed, images).await
+}
+
+/// Image attachments go inline when fx accepts images; their paths still follow the text.
+async fn images(handle: &Handle, input: &Value) -> io::Result<Vec<Value>> {
+    if handle.acp.lock().unwrap()["promptCapabilities"]["image"] != true {
+        return Ok(Vec::new());
+    }
+    // Leave room in the ACP frame for the text, the instructions, and the envelope.
+    let used = serde_json::to_vec(input)?.len() + cursor::instructions(handle).len() + 4096;
+    let remaining = super::process::MAX_LINE.saturating_sub(used);
+    let (reader, input) = (handle.clone(), input.clone());
+    tokio::task::spawn_blocking(move || super::files::images(&reader, &input, remaining))
+        .await
+        .map_err(io::Error::other)?
+        // No prompt was sent: reject this request and allow queued work to continue.
+        .map_err(|error| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("cannot read image attachment: {error}"),
+            )
+        })
 }
 
 /// fx joins a steer to the running turn without cancelling its work. Older fx cancels and resends.
@@ -135,7 +163,7 @@ fn offers(session: &Value, option: &str, value: &str) -> bool {
         .is_some_and(|options| options.iter().any(|o| o["value"] == value))
 }
 
-async fn set(handle: &Handle, id: &str, option: &str, value: &str) -> io::Result<Value> {
+async fn set(handle: &Handle, id: &str, option: &str, value: &str) -> io::Result<()> {
     let result = handle
         .call(
             "session/set_config_option",
@@ -147,7 +175,8 @@ async fn set(handle: &Handle, id: &str, option: &str, value: &str) -> io::Result
             "fx did not confirm {option} {value}"
         )));
     }
-    Ok(result)
+    *handle.acp_config.lock().unwrap() = result;
+    Ok(())
 }
 
 pub(super) fn validate(

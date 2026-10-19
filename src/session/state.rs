@@ -156,6 +156,10 @@ impl Local {
                 "failed" => counts.failed += 1,
                 _ => {}
             }
+            // An archived thread's leftover jobs, or a low-disk pause, never keep the sandbox awake.
+            if !session.archived && !session.storage_paused && session.has_background_jobs() {
+                counts.background += 1;
+            }
             counts.last_activity = counts.last_activity.max(session.last_activity);
         }
         counts

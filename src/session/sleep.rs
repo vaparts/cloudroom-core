@@ -46,6 +46,18 @@ impl Session {
             )
     }
 
+    /// Processes beyond the harness's count at launch: background jobs such as downloads, builds, or dev servers.
+    pub(super) fn has_background_jobs(&self) -> bool {
+        let (Some(handle), Some(awake)) = (&self.handle, self.awake) else {
+            return false;
+        };
+        awake.pid == handle.pid()
+            && handle
+                .process_count()
+                .zip(awake.processes)
+                .is_some_and(|(now, baseline)| now > baseline)
+    }
+
     fn idle_ms(&self, now: u64) -> u64 {
         let since = self.last_activity.unwrap_or(0);
         now.saturating_sub(since.max(self.awake.map_or(0, |a| a.since_ms)))
@@ -65,17 +77,11 @@ impl Local {
     /// Only an idle harness with no queued work, children, or background jobs may stop.
     fn can_sleep(&self, id: &str) -> bool {
         let s = &self.sessions[id];
-        let Some(handle) = &s.handle else {
+        if s.handle.is_none() {
             return false;
-        };
+        }
         // New background jobs (dev servers, watchers) count as activity; uncertain means keep running.
-        let background = s.awake.is_some_and(|a| {
-            a.pid == handle.pid()
-                && handle
-                    .process_count()
-                    .zip(a.processes)
-                    .is_some_and(|(now, baseline)| now > baseline)
-        });
+        let background = s.has_background_jobs();
         s.ready
             && !s.releasing
             && s.state == "idle"
@@ -124,6 +130,10 @@ impl Manager {
         }
         if super::relay::report_pending(&local) {
             return json!({"drained":false,"reason":"report_pending"});
+        }
+        // ADR 0031: background jobs keep the sandbox awake. The website stops it two hours after the last activity.
+        if local.agent_counts().background > 0 {
+            return json!({"drained":false,"reason":"background_jobs"});
         }
         local.draining = true;
         // The sandbox stops next, so its next start replays almost nothing.

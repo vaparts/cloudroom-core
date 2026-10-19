@@ -730,7 +730,15 @@ class RecoveryTests(unittest.TestCase):
         (self.state/'pending.tmp').mkdir()
         self.service.request('POST','/v1/sessions/cr_seed/prompts',{'request_id':'fault','text':'hello'},503)
         (self.state/'pending.tmp').rmdir()
-        self.service.request('POST','/v1/sessions/cr_seed/prompts',{'request_id':'again','text':'hello'},503)
+        # A write that failed before its rename (a full disk) changed nothing, so the next one goes ahead.
+        self.prompt('again','hello')
+        self.wait(lambda:self.status()['receipts']['again']['state']=='completed','write after a full disk')
+        # A failed rename is uncertain: nothing is written until a restart reopens the journal.
+        target = self.state/f"{self.service.request('GET','/v1/health')['saving']['locally_recorded_through'] + 1:020}.record"
+        target.mkdir()
+        self.service.request('POST','/v1/sessions/cr_seed/prompts',{'request_id':'uncertain','text':'hello'},503)
+        target.rmdir()
+        self.service.request('POST','/v1/sessions/cr_seed/prompts',{'request_id':'blocked','text':'hello'},503)
         self.assertFalse(self.service.request('GET','/v1/ready',expected=503)['ready'])
         self.assertFalse(self.service.request('GET','/v1/dashboard')['runtime']['ready'])
         self.service.request('POST','/v1/sessions/cr_seed/attachments?request_id=blocked&name=note.txt&kind=file',{},503)

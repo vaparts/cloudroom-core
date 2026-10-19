@@ -28,6 +28,18 @@ pub struct Workload {
     paused: watch::Sender<bool>,
 }
 
+/// A process group's disk writes, and the command line of its heaviest member.
+pub struct Writer {
+    pub bytes: u64,
+    pids: Vec<i32>,
+    pub command: String,
+}
+impl Writer {
+    pub fn kill(&self) {
+        self.pids.iter().for_each(|pid| signal(*pid, SIGKILL));
+    }
+}
+
 impl Workload {
     pub fn create(policy: &Policy) -> io::Result<Self> {
         let id = format!(
@@ -126,10 +138,9 @@ impl Workload {
                 .count(),
         )
     }
-    /// Kills the process group, other than the harness's own, that wrote the most to disk: a tool command,
-    /// never the harness or its helpers. The youngest group wins when write counts are
-    /// unreadable. Returns the heaviest writer's command line, or None when nothing but the harness remains.
-    pub fn kill_top_writer(&self, harness: u32) -> io::Result<Option<String>> {
+    /// The process group, other than the harness's own, that wrote the most to disk: a tool command, never the
+    /// harness or its helpers. The youngest group wins ties. None when nothing but the harness remains.
+    pub fn top_writer(&self, harness: u32) -> io::Result<Option<Writer>> {
         let pids = self.pids()?;
         let own_group = stat(harness as i32).map(|(group, _)| group);
         let mut groups: std::collections::HashMap<i32, Vec<(i32, u64, u64)>> = Default::default();
@@ -163,8 +174,11 @@ impl Workload {
                     .to_owned()
             })
             .unwrap_or_default();
-        members.iter().for_each(|p| signal(p.0, SIGKILL));
-        Ok(Some(command))
+        Ok(Some(Writer {
+            bytes: members.iter().map(|p| p.1).sum(),
+            pids: members.iter().map(|p| p.0).collect(),
+            command,
+        }))
     }
     pub fn terminate(&self) -> io::Result<()> {
         match &self.group {
@@ -296,10 +310,17 @@ fn written(pid: i32) -> u64 {
         .unwrap_or(0)
 }
 fn signal(pid: i32, number: i32) {
+    send(pid, number);
+}
+/// Asks a process to stop (SIGTERM). False when Core cannot signal it, such as another account's process.
+pub(crate) fn terminate(pid: u32) -> bool {
+    send(pid as i32, 15)
+}
+fn send(pid: i32, number: i32) -> bool {
     unsafe extern "C" {
         fn kill(pid: i32, signal: i32) -> i32;
     }
-    unsafe { kill(pid, number) };
+    unsafe { kill(pid, number) == 0 }
 }
 
 #[cfg(target_os = "linux")]
@@ -424,8 +445,10 @@ mod tests {
             group: Group::Marked(id),
             paused: watch::channel(false).0,
         };
-        let stopped = workload.kill_top_writer(harness.id()).unwrap().unwrap();
-        assert!(stopped.starts_with("sh -c i=0"), "{stopped}");
+        let top = workload.top_writer(harness.id()).unwrap().unwrap();
+        assert!(top.command.starts_with("sh -c i=0"), "{}", top.command);
+        assert!(top.bytes >= 64_000_000, "{}", top.bytes);
+        top.kill();
         assert!(
             writer.wait().unwrap().code().is_none(),
             "the writer was killed"

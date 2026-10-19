@@ -289,6 +289,7 @@ impl Observability {
                 let counts = agents();
                 busy |= counts.working > 0
                     || counts.queued > 0
+                    || counts.background > 0
                     || counts.last_activity.is_some_and(|at| at >= cpu_since_ms);
                 if Instant::now() >= cpu_at {
                     resources.cpu_minute = sampler.minute(busy);

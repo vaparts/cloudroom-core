@@ -84,6 +84,7 @@ impl Config {
             "opencode" => Kind::OpenCode,
             "hermes" => Kind::Hermes,
             "devin" => Kind::Devin,
+            "openclaw" => Kind::OpenClaw,
             _ => return Err(io::Error::other("unsupported CLOUDROOM_HARNESS")),
         };
         let account_home: PathBuf = required("CLOUDROOM_ACCOUNT_HOME")?.into();
@@ -171,6 +172,25 @@ impl Config {
                     },
                 );
             }
+        }
+        // OpenClaw's rootless installer keeps its CLI in ~/.openclaw/bin; npm puts it on the PATH.
+        let openclaw = [
+            account_home.join(".openclaw/bin/openclaw"),
+            account_home.join(".local/bin/openclaw"),
+            PathBuf::from("/usr/local/bin/openclaw"),
+        ]
+        .into_iter()
+        .find(|path| path.is_file());
+        if let Some(binary) = openclaw.filter(|_| account_home.join(".openclaw").is_dir()) {
+            harnesses.insert(
+                Kind::OpenClaw,
+                HarnessConfig {
+                    binary,
+                    home: account_home.join(".openclaw"),
+                    model: "default".into(),
+                    provider: None,
+                },
+            );
         }
         Ok(Self {
             storage,

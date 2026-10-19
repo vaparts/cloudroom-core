@@ -29,24 +29,52 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
     }
 }
 
+enum Copy {
+    Ready(PathBuf),
+    Failed(PathBuf, String),
+    NotRunning,
+}
+
+/// One look at the project copy. `None` while it runs, or may be about to start.
+fn check(cwd: &Path, waited: Duration) -> Option<Copy> {
+    let found = status_file(cwd);
+    let state = found
+        .as_ref()
+        .and_then(|(_, file)| std::fs::read_to_string(file).ok());
+    match (found, state.as_deref().map(str::trim)) {
+        (Some((folder, _)), Some("ready")) => Some(Copy::Ready(folder)),
+        (Some((folder, _)), Some(state)) if state.starts_with("failed") => {
+            let reason = state
+                .trim_start_matches("failed")
+                .trim_start_matches(':')
+                .trim();
+            Some(Copy::Failed(folder, reason.into()))
+        }
+        (Some(_), _) => None,
+        (None, _) if waited >= GRACE || !looks_empty(cwd) => Some(Copy::NotRunning),
+        (None, _) => None,
+    }
+}
+
+/// Waits quietly until a running project copy lands or fails, up to `limit`.
+/// Skills selected in a new thread's first message use this before they give up (ADR 0209).
+pub async fn settle(cwd: &Path, limit: Duration) {
+    let start = Instant::now();
+    while check(cwd, start.elapsed()).is_none() && start.elapsed() < limit {
+        tokio::time::sleep(POLL).await;
+    }
+}
+
 async fn wait(cwd: &Path) -> io::Result<i32> {
     let start = Instant::now();
     let mut announced = false;
     loop {
-        let found = status_file(cwd);
-        let state = found
-            .as_ref()
-            .and_then(|(_, file)| std::fs::read_to_string(file).ok());
-        match (found.as_ref(), state.as_deref().map(str::trim)) {
-            (Some((folder, _)), Some("ready")) => {
+        match check(cwd, start.elapsed()) {
+            Some(Copy::Ready(folder)) => {
                 println!("Project files are ready in {}.", folder.display());
                 return Ok(0);
             }
-            (Some((folder, _)), Some(state)) if state.starts_with("failed") => {
-                let reason = state
-                    .trim_start_matches("failed")
-                    .trim_start_matches(':')
-                    .trim();
+            Some(Copy::Failed(folder, reason)) => {
                 // The failure note says the same and where the full project is.
                 match std::fs::read_to_string(folder.join(FAILURE_NOTE)) {
                     Ok(note) => println!("{}", note.trim()),
@@ -56,14 +84,13 @@ async fn wait(cwd: &Path) -> io::Result<i32> {
                 }
                 return Ok(1);
             }
-            (Some(_), _) => {}
-            (None, _) if start.elapsed() >= GRACE || !looks_empty(cwd) => {
+            Some(Copy::NotRunning) => {
                 println!(
                     "No project copy is running. If files are missing, the project may be on the user's Mac: pull what you need with `room-cli mac pull`."
                 );
                 return Ok(0);
             }
-            (None, _) => {}
+            None => {}
         }
         if start.elapsed() >= LIMIT {
             println!(

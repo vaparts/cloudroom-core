@@ -399,11 +399,11 @@ impl Process {
             .freeze(paused)
             .await
     }
-    pub fn kill_top_writer(&self) -> io::Result<Option<String>> {
+    pub fn top_writer(&self) -> io::Result<Option<linux::Writer>> {
         self.group
             .as_ref()
             .ok_or_else(|| io::Error::other("workload containment unavailable"))?
-            .kill_top_writer(self.pid)
+            .top_writer(self.pid)
     }
     pub fn request_shutdown(&self) {
         if let Some(group) = &self.group
