@@ -3,6 +3,7 @@
 //! A child gets a sandbox of its own by default (ADR 0229). The app starts it, so Core records the request and
 //! waits briefly for the app's answer; without one, the child starts in this sandbox instead. Once started, the
 //! website carries its `tell`, `stop`, `archive` and turn reports, even while the app is closed (relay.rs).
+//! `spawn --top-level` asks the website to start a top-level thread instead, with no link back (ADR 0267).
 use super::{Manager, relay};
 use crate::preview::Peer;
 use axum::{
@@ -25,7 +26,7 @@ const USAGE: &str = "room-cli thread update --self --title TITLE
 room-cli thread update --self --reasoning-level LEVEL
 room-cli thread archive --self
 room-cli thread stop --self
-room-cli thread spawn --provider codex|claude-code|pi|opencode|hermes|devin [--model MODEL] [--reasoning-level LEVEL] [--service-tier default|fast] [--title TITLE] [--shared-sandbox] --prompt TEXT|--prompt-file PATH
+room-cli thread spawn --provider codex|claude-code|pi|opencode|hermes|devin|fx|openclaw [--model MODEL] [--reasoning-level LEVEL] [--service-tier default|fast] [--title TITLE] [--shared-sandbox|--top-level] --prompt TEXT|--prompt-file PATH
 room-cli thread list [--include-archived]
 room-cli thread output CHILD_ID [--all]
 room-cli thread tell CHILD_ID TEXT
@@ -34,6 +35,9 @@ room-cli thread archive CHILD_ID";
 const SPAWN_NOTE: &str = "Started in this sandbox and folder. Keep working: Cloudroom sends you a message each time it finishes a turn.";
 const OWN_NOTE: &str = "Started in its own sandbox with a copy of your code (commits and uncommitted changes), on its own branch. It doesn't see your later edits; share work through Git. Use this ID with tell, stop and archive. Keep working: Cloudroom sends you a message each time it finishes a turn.";
 const FALLBACK_NOTE: &str = " The user's Cloudroom app didn't start it in its own sandbox (it's probably closed), so it runs here.";
+const TOP_NOTE: &str = "Started as a top-level thread in its own sandbox, from the project's GitHub repo (push your work first) and .env files. It is not your child: it doesn't report back, and you can't tell, stop or read it. It shows in the user's sidebar within a minute.";
+/// How long `spawn --top-level` keeps retrying a start the website could not finish (say, a slow wake).
+const LAUNCH_RETRY: Duration = Duration::from_secs(240);
 /// How long a spawn waits for the app to start the child in its own sandbox, and how long after a miss spawns
 /// share this sandbox right away, so a closed app costs one wait, not one per child.
 const APP_WAIT: Duration = Duration::from_secs(60);
@@ -73,6 +77,9 @@ pub struct SpawnBody {
     /// Run the child in this sandbox and folder instead of a sandbox of its own (ADR 0229).
     #[serde(default)]
     shared: bool,
+    /// Start a top-level thread instead of a child (ADR 0267).
+    #[serde(default)]
+    top_level: bool,
     service_tier: Option<String>,
 }
 
@@ -274,7 +281,7 @@ async fn spawn(
         .as_deref()
         .map(|p| {
             serde_json::from_value(json!(p)).map_err(|_| {
-                bad("Use --provider codex, claude-code, pi, opencode, hermes or devin")
+                bad("Use --provider codex, claude-code, pi, opencode, hermes, devin, fx or openclaw")
             })
         })
         .transpose()?;
@@ -313,6 +320,14 @@ async fn spawn(
             "request_id must be 1-64 ASCII letters, digits, underscores or hyphens",
         ));
     }
+    if input.top_level {
+        if input.shared {
+            return Err(bad(
+                "A top-level thread gets a sandbox of its own. Omit --shared-sandbox.",
+            ));
+        }
+        return launch(&m, &parent, key, input).await;
+    }
     let mut note = SPAWN_NOTE.to_owned();
     if !input.shared {
         match own_sandbox_child(&m, &parent, &key, &input).await? {
@@ -342,6 +357,56 @@ async fn spawn(
     Ok(Json(
         json!({"id":id,"harness":receipt.input["harness"],"model":receipt.model,"note":note}),
     ))
+}
+
+/// Asks the website to start a top-level thread (ADR 0267), so it works while the Mac is off. It runs as a task of
+/// its own, so an agent that stops waiting never cuts a start in half, and a retry with the same request ID
+/// continues the same start instead of making a second thread.
+async fn launch(
+    m: &Arc<Manager>,
+    session: &str,
+    key: String,
+    input: SpawnBody,
+) -> Result<Json<Value>, Failure> {
+    let Some(api) = m.history.api.clone() else {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "Run room-cli thread spawn --top-level from a Cloudroom cloud thread",
+        ));
+    };
+    let body = json!({"request_id":key,"session":session,"prompt":input.prompt,"title":input.title,"harness":input.provider,"model":input.model,"reasoning":input.reasoning,"service_tier":input.service_tier});
+    let started = Instant::now();
+    let task = tokio::spawn(async move {
+        let mut wait = Duration::from_secs(10);
+        loop {
+            match api.post_waking("launch", &body).await {
+                // The website's time ran out, or the new sandbox is still busy with the last try's wake.
+                Err(super::history::ApiError::Network(_))
+                | Err(super::history::ApiError::Status(500..=599, _))
+                    if started.elapsed() < LAUNCH_RETRY => {}
+                Err(super::history::ApiError::Status(409, message))
+                    if message.starts_with("This sandbox is busy")
+                        && started.elapsed() < LAUNCH_RETRY => {}
+                other => return other,
+            }
+            tokio::time::sleep(wait).await;
+            wait = (wait * 2).min(Duration::from_secs(60));
+        }
+    });
+    match task.await {
+        Ok(Ok(answer)) => Ok(Json(json!({"id":answer["id"],"note":TOP_NOTE}))),
+        Ok(Err(super::history::ApiError::Status(status, message))) => Err(fail(
+            StatusCode::from_u16(status).unwrap_or(StatusCode::BAD_GATEWAY),
+            &message,
+        )),
+        Ok(Err(error)) => Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &format!(
+                "The top-level thread may not have started: {error}. Run the same command with --request-id {key}; it never starts twice."
+            ),
+        )),
+        Err(error) => Err(fail(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string())),
+    }
 }
 
 /// Asks the app to start the child in a sandbox of its own with a copy of this thread's code, and waits for
@@ -691,7 +756,7 @@ fn unknown_spawn_word<'a>(words: &[&'a str]) -> Option<&'a str> {
     while let Some(word) = rest.next() {
         if SPAWN_VALUES.contains(word) {
             rest.next();
-        } else if !matches!(*word, "--shared-sandbox" | "--parent-self") {
+        } else if !matches!(*word, "--shared-sandbox" | "--parent-self" | "--top-level") {
             return Some(word);
         }
     }
@@ -729,7 +794,22 @@ async fn spawn_cli(words: &[&str]) -> io::Result<i32> {
             return Ok(2);
         }
     };
-    let mut body = json!({"prompt":prompt,"shared":words.contains(&"--shared-sandbox")});
+    let top = words.contains(&"--top-level");
+    if top && words.contains(&"--parent-self") {
+        eprintln!("A top-level thread has no parent. Omit --parent-self.");
+        return Ok(2);
+    }
+    let mut body =
+        json!({"prompt":prompt,"shared":words.contains(&"--shared-sandbox"),"top_level":top});
+    // A top-level start can outlast the agent's command timeout, so its request ID comes first: rerunning the
+    // command with it continues that start instead of making a second thread.
+    if top && flag(words, "--request-id").is_none() {
+        let key = random_key()?;
+        eprintln!(
+            "Starting a top-level thread. If this command times out, rerun it with --request-id {key}; it never starts twice."
+        );
+        body["request_id"] = json!(key);
+    }
     for (name, key) in [
         ("--provider", "provider"),
         ("--model", "model"),
@@ -827,7 +907,7 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         }
         _ => {
             println!(
-                "{USAGE}\nRenames, archives or changes the effort of this cloud thread, or starts, checks, stops and archives its child threads."
+                "{USAGE}\nRenames, archives or changes the effort of this cloud thread, or starts, checks, stops and archives its child threads. --top-level starts a top-level thread instead of a child, only when the user asks for one."
             );
             return Ok(if words.is_empty() { 0 } else { 2 });
         }

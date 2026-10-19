@@ -184,9 +184,7 @@ impl Journal {
                 "journal requires recovery after a write failure",
             ));
         }
-        // A rename followed by a failed directory fsync has an uncertain outcome.
-        // Refuse further writes until reopening, rather than overwrite that record.
-        self.writable = false;
+        // A failure before the rename leaves the journal as it was (a full disk fails here), so only that write fails.
         let temporary = self.directory.join("pending.tmp");
         let mut file = OpenOptions::new()
             .write(true)
@@ -196,6 +194,9 @@ impl Journal {
             .open(&temporary)?;
         file.write_all(bytes)?;
         file.sync_all()?;
+        // A rename followed by a failed directory fsync has an uncertain outcome.
+        // Refuse further writes until reopening, rather than overwrite that record.
+        self.writable = false;
         fs::rename(temporary, self.directory.join(name))?;
         File::open(&self.directory)?.sync_all()?;
         self.writable = true;

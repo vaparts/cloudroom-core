@@ -142,7 +142,8 @@ impl Manager {
                 | runtime::Kind::Fx
                 | runtime::Kind::OpenCode
                 | runtime::Kind::Hermes
-                | runtime::Kind::Devin => {
+                | runtime::Kind::Devin
+                | runtime::Kind::OpenClaw => {
                     let capabilities = runtime::cursor::capabilities(*kind);
                     for (key, value) in capabilities.as_object().unwrap() {
                         harness[key] = value.clone();
@@ -151,12 +152,16 @@ impl Manager {
                         runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS,
                         runtime::Kind::Hermes => runtime::HERMES_REASONING_LEVELS,
                         runtime::Kind::Devin => runtime::DEVIN_REASONING_LEVELS,
+                        runtime::Kind::OpenClaw => runtime::OPENCLAW_REASONING_LEVELS,
                         _ => runtime::PI_REASONING_LEVELS,
                     });
-                    // Cursor's print mode has no image input; Cursor and OpenCode open images from the attached path.
-                    harness["attachments"] =
-                        json!({"images":*kind != runtime::Kind::Fx,"files":true});
+                    // Cursor and OpenCode open images from the attached path; fx gets them inline.
+                    harness["attachments"] = json!({"images":true,"files":true});
                     harness["provider_selection"] = json!(false);
+                    // fx switches effort per turn; the others keep the launch level.
+                    if *kind == runtime::Kind::Fx {
+                        harness["prompt_reasoning"] = json!(true);
+                    }
                     if *kind == runtime::Kind::Cursor {
                         harness["models"] = if self.storage.blocks() {
                             Value::Null
@@ -202,10 +207,10 @@ impl Manager {
             if matches!(
                 session.harness,
                 runtime::Kind::Cursor
-                    | runtime::Kind::Fx
                     | runtime::Kind::OpenCode
                     | runtime::Kind::Hermes
                     | runtime::Kind::Devin
+                    | runtime::Kind::OpenClaw
             ) && session.reasoning.as_deref() != Some(reasoning)
             {
                 return Err(Error::Conflict("invalid reasoning effort"));
@@ -228,6 +233,7 @@ impl Manager {
             runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::Hermes => runtime::HERMES_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::Devin => runtime::DEVIN_REASONING_LEVELS.contains(&reasoning),
+            runtime::Kind::OpenClaw => runtime::OPENCLAW_REASONING_LEVELS.contains(&reasoning),
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));

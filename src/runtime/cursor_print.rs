@@ -8,14 +8,14 @@ use std::{
     io::{self, BufRead, BufReader, Read, Write},
     os::unix::process::{CommandExt, ExitStatusExt},
     path::PathBuf,
-    process::{Command, Stdio},
+    process::{Child, Command, Stdio},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, Ordering},
-        mpsc,
+        mpsc::{self, Receiver, RecvTimeoutError},
     },
     thread,
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 const SIGKILL: i32 = 9;
@@ -56,6 +56,12 @@ impl State {
 
 pub fn run(binary: &str) -> io::Result<()> {
     STATE.lock().unwrap().binary = binary.to_owned();
+    let _ = KEY_AT_START.set(saved_key());
+    // Tools that detach from Cursor become this driver's children, so Stop can still find them.
+    #[cfg(target_os = "linux")]
+    unsafe {
+        prctl(PR_SET_CHILD_SUBREAPER, 1_u64)
+    };
     for line in io::stdin().lock().lines() {
         if let Ok(message @ Value::Object(_)) = serde_json::from_str(&line?) {
             handle(&message);
@@ -63,7 +69,8 @@ pub fn run(binary: &str) -> io::Result<()> {
     }
     let turn = STATE.lock().unwrap().turn.clone();
     if let Some(turn) = turn {
-        let _ = turn.cancel().join();
+        turn.cancel();
+        turn.wait();
     }
     Ok(())
 }
@@ -91,7 +98,31 @@ fn update(kind: &str, mut fields: Value) {
 fn cursor(cwd: &str) -> Command {
     let mut command = Command::new(&STATE.lock().unwrap().binary);
     command.arg("--disable-auto-update").current_dir(cwd);
+    // A login can change while this driver runs, so every Cursor process reads the saved key.
+    match saved_key() {
+        Some(key) => {
+            command.env("CURSOR_API_KEY", key);
+        }
+        // The key Core passed at start was the saved one, which is gone: use the browser login.
+        None if KEY_AT_START
+            .get()
+            .is_some_and(|key| key.is_some() && std::env::var("CURSOR_API_KEY").ok() == *key) =>
+        {
+            command.env_remove("CURSOR_API_KEY");
+        }
+        None => {}
+    }
     command
+}
+
+static KEY_AT_START: OnceLock<Option<String>> = OnceLock::new();
+
+/// The API key Core saves for Cursor (cursor_auth.rs), if any.
+fn saved_key() -> Option<String> {
+    let home = PathBuf::from(std::env::var_os("HOME")?);
+    let key = std::fs::read_to_string(home.join(".cursor/cloudroom-api-key")).ok()?;
+    (!key.is_empty() && key.len() <= 4096 && key.bytes().all(|byte| byte.is_ascii_graphic()))
+        .then_some(key)
 }
 
 fn cli(args: &[&str], cwd: &str) -> io::Result<String> {
@@ -121,6 +152,38 @@ fn cli(args: &[&str], cwd: &str) -> io::Result<String> {
         }));
     }
     Ok(stdout)
+}
+
+/// Cursor prints the new chat's ID, then may never exit; take the ID and end it.
+fn create_chat(cwd: &str) -> io::Result<String> {
+    let mut command = cursor(cwd);
+    command
+        .arg("create-chat")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    unsafe {
+        command.pre_exec(|| match setsid() {
+            -1 => Err(io::Error::last_os_error()),
+            _ => Ok(()),
+        });
+    }
+    let mut child = command.spawn()?;
+    let stdout = child.stdout.take().unwrap();
+    let (found, id) = mpsc::channel();
+    thread::spawn(move || {
+        let id = (BufReader::new(stdout).lines().map_while(Result::ok))
+            .map(|line| line.trim().to_owned())
+            .find(|line| super::cursor::valid_id(line));
+        let _ = found.send(id);
+    });
+    let id = id.recv_timeout(Duration::from_secs(60));
+    stop(&mut child, &[], false, &|| false);
+    match id {
+        Ok(Some(id)) => Ok(id),
+        Ok(None) => Err(io::Error::other("Cursor did not create a chat")),
+        Err(_) => Err(io::Error::other("Cursor CLI timed out")),
+    }
 }
 
 fn open_session(request: &Value, session: &str, cwd: &str) -> io::Result<()> {
@@ -156,18 +219,25 @@ fn open_session(request: &Value, session: &str, cwd: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn descendants(pid: i32) -> Vec<i32> {
+/// Every process's (pid, parent pid).
+fn processes() -> Vec<(i32, i32)> {
     let table = Command::new("ps")
         .args(["-A", "-o", "pid=", "-o", "ppid="])
         .output()
         .map(|output| String::from_utf8_lossy(&output.stdout).into_owned())
         .unwrap_or_default();
+    (table.lines())
+        .filter_map(|row| {
+            let mut ids = row.split_whitespace().filter_map(|id| id.parse().ok());
+            Some((ids.next()?, ids.next()?))
+        })
+        .collect()
+}
+
+fn descendants(pid: i32) -> Vec<i32> {
     let mut children: HashMap<i32, Vec<i32>> = HashMap::new();
-    for row in table.lines() {
-        let mut ids = row.split_whitespace().filter_map(|id| id.parse().ok());
-        if let (Some(child), Some(parent)) = (ids.next(), ids.next()) {
-            children.entry(parent).or_default().push(child);
-        }
+    for (child, parent) in processes() {
+        children.entry(parent).or_default().push(child);
     }
     let (mut found, mut stack) = (Vec::new(), vec![pid]);
     while let Some(parent) = stack.pop() {
@@ -179,27 +249,125 @@ fn descendants(pid: i32) -> Vec<i32> {
     found
 }
 
-unsafe extern "C" {
-    fn kill(pid: i32, signal: i32) -> i32;
-    fn getpgid(pid: i32) -> i32;
-    fn setsid() -> i32;
-}
-
-fn signal_groups(pids: &[i32], signal: i32) {
-    // Cursor starts shell tools in their own process groups, so stop each group.
-    for &pid in pids {
-        let group = unsafe { getpgid(pid) };
-        // Never signal group 1 or an error result: kill(-1) reaches every process.
-        if group > 1 {
-            unsafe { kill(-group, signal) };
+/// Collects detached tools that exited; as their subreaper, this driver must. `keep` is Cursor itself,
+/// which its `Child` collects.
+fn reap(keep: i32) {
+    let me = std::process::id() as i32;
+    for (pid, parent) in processes() {
+        if parent == me && pid != keep && !running(pid) {
+            unsafe { waitpid(pid, std::ptr::null_mut(), WNOHANG) };
         }
     }
 }
 
+unsafe extern "C" {
+    fn kill(pid: i32, signal: i32) -> i32;
+    fn setsid() -> i32;
+    fn waitpid(pid: i32, status: *mut i32, options: i32) -> i32;
+}
+const WNOHANG: i32 = 1;
+
+#[cfg(target_os = "linux")]
+unsafe extern "C" {
+    fn prctl(option: i32, ...) -> i32;
+}
+#[cfg(target_os = "linux")]
+const PR_SET_CHILD_SUBREAPER: i32 = 36;
+
+/// Whether a process still runs. A zombie has already stopped.
+fn running(pid: i32) -> bool {
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap_or_default();
+    let zombie = (stat.rsplit(')').next()).is_some_and(|rest| rest.trim_start().starts_with('Z'));
+    let alive = unsafe { kill(pid, 0) } == 0;
+    alive && !zombie
+}
+
+/// TERM first; KILL whatever still runs after this.
+const TERM_GRACE: Duration = Duration::from_millis(1500);
+/// Stop gives up after this, within Core's 4 s shutdown grace.
+const STOP_LIMIT: Duration = Duration::from_secs(3);
+
+/// Ends Cursor and, with `tools` (or once `escalate` says so), every process started since
+/// `baseline` was taken. It rescans until none is left: tools fork while being stopped, and detached
+/// ones stay this driver's descendants. Returns whether everything stopped.
+fn stop(child: &mut Child, baseline: &[i32], mut tools: bool, escalate: &dyn Fn() -> bool) -> bool {
+    let cursor = child.id() as i32;
+    let me = std::process::id() as i32;
+    let (mut start, mut signalled) = (Instant::now(), Vec::new());
+    loop {
+        let _ = child.try_wait();
+        if !tools && escalate() {
+            (tools, start) = (true, Instant::now());
+        }
+        let mut targets = if tools {
+            descendants(me)
+        } else {
+            descendants(cursor)
+        };
+        targets.retain(|pid| !baseline.contains(pid));
+        targets.push(cursor);
+        targets.retain(|&pid| running(pid));
+        if targets.is_empty() {
+            reap(cursor);
+            return true;
+        }
+        if start.elapsed() > STOP_LIMIT {
+            return false;
+        }
+        let late = start.elapsed() > TERM_GRACE;
+        for pid in targets {
+            if late || !signalled.contains(&pid) {
+                unsafe { kill(pid, if late { SIGKILL } else { SIGTERM }) };
+                signalled.push(pid);
+            }
+        }
+        reap(cursor);
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// Calls `each` with every output line, skipping lines too long to hold, until `each` returns false.
+fn lines(mut reader: impl BufRead, mut each: impl FnMut(&[u8]) -> bool) {
+    const LIMIT: u64 = 16 << 20;
+    let mut line = Vec::new();
+    let mut whole = true;
+    loop {
+        line.clear();
+        match reader.by_ref().take(LIMIT).read_until(b'\n', &mut line) {
+            Ok(0) | Err(_) => return,
+            Ok(_) => {
+                let ended = line.ends_with(b"\n") || (line.len() as u64) < LIMIT;
+                if whole && ended && !each(&line) {
+                    return;
+                }
+                whole = ended;
+            }
+        }
+    }
+}
+
+/// The first 64 KB of what Cursor writes to stderr, where its error is. The rest is read and dropped.
+fn head_of(mut reader: impl Read) -> String {
+    let mut kept = Vec::new();
+    let _ = reader.by_ref().take(64 << 10).read_to_end(&mut kept);
+    let _ = io::copy(&mut reader, &mut io::sink());
+    String::from_utf8_lossy(&kept).into_owned()
+}
+
+/// How long Cursor gets to exit after its final result, or after it closes its output.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+/// Silence with no tool running means Cursor is stuck, not thinking.
+const SILENCE: Duration = Duration::from_secs(600);
+/// How long to wait for Cursor's last output once it has exited; shorter after a stop.
+const DRAIN: Duration = Duration::from_secs(2);
+const STOPPED_DRAIN: Duration = Duration::from_millis(400);
+
 struct Turn {
     request: Value,
-    pid: i32,
     cancelled: AtomicBool,
+    supervisor: Mutex<Option<thread::JoinHandle<()>>>,
+    /// Processes that ran before this turn, such as a server an earlier turn left running.
+    baseline: Vec<i32>,
 }
 
 impl Turn {
@@ -211,6 +379,8 @@ impl Turn {
         let (Some(session), Some(cwd)) = (session, cwd) else {
             return Err(io::Error::other("Cursor turn has no session"));
         };
+        reap(0);
+        let baseline = descendants(std::process::id() as i32);
         let mut command = cursor(&cwd);
         command
             .args(["-p", "--trust", "--force", "--output-format", "stream-json"])
@@ -228,74 +398,203 @@ impl Turn {
         let mut child = command.spawn()?;
         let turn = Arc::new(Turn {
             request: request.clone(),
-            pid: child.id() as i32,
             cancelled: AtomicBool::new(false),
+            supervisor: Mutex::new(None),
+            baseline,
         });
         STATE.lock().unwrap().turn = Some(turn.clone());
         let mut stdin = child.stdin.take().unwrap();
         thread::spawn(move || stdin.write_all(text.as_bytes()));
-        let mut stderr = child.stderr.take().unwrap();
-        let stderr = thread::spawn(move || {
-            let mut bytes = Vec::new();
-            let _ = stderr.read_to_end(&mut bytes);
-            String::from_utf8_lossy(&bytes).into_owned()
-        });
+        let stderr = child.stderr.take().unwrap();
+        let (stderr_tx, stderr_rx) = mpsc::channel();
+        thread::spawn(move || stderr_tx.send(head_of(stderr)));
         let stdout = child.stdout.take().unwrap();
+        let (output_tx, output_rx) = mpsc::channel();
+        // Only the supervisor forwards events; once the turn ends, sends fail and reading stops.
         thread::spawn(move || {
-            let (mut segment, mut outcome) = (String::new(), None);
-            for line in BufReader::new(stdout).split(b'\n').map_while(Result::ok) {
+            lines(BufReader::new(stdout), |line| {
                 // One unreadable event must not end the turn.
-                let Ok(event @ Value::Object(_)) = serde_json::from_slice::<Value>(&line) else {
-                    continue;
-                };
-                segment = translate(&event, segment);
-                if event["type"] == "result" {
-                    outcome = Some(event);
+                match serde_json::from_slice::<Value>(line) {
+                    Ok(event @ Value::Object(_)) => output_tx.send(event).is_ok(),
+                    _ => true,
                 }
-            }
-            let status = child.wait();
-            let stderr = stderr.join().unwrap_or_default();
-            STATE.lock().unwrap().turn = None;
-            turn.finish(outcome, status, &stderr);
+            })
         });
+        let supervisor = turn.clone();
+        let handle = thread::spawn(move || supervisor.supervise(child, output_rx, stderr_rx));
+        *turn.supervisor.lock().unwrap() = Some(handle);
         Ok(())
     }
 
-    fn finish(
-        &self,
-        outcome: Option<Value>,
-        status: io::Result<std::process::ExitStatus>,
-        stderr: &str,
-    ) {
-        if self.cancelled.load(Ordering::SeqCst) {
-            return reply(&self.request, Ok(json!({"stopReason":"cancelled"})));
-        }
-        let outcome = outcome.unwrap_or_default();
-        if !outcome.is_null() && !truthy(&outcome["is_error"]) {
-            return reply(&self.request, Ok(json!({"stopReason":"end_turn"})));
-        }
-        let code = status.map_or(-1, |s| s.code().unwrap_or_else(|| -s.signal().unwrap_or(0)));
-        let detail = match &outcome["result"] {
-            result if truthy(result) => text(result),
-            _ if !stderr.trim().is_empty() => tail(stderr.trim(), 500).to_owned(),
-            _ => format!("exit code {code}"),
-        };
-        reply(
-            &self.request,
-            Err(json!({"code":-32603,"message":format!("Cursor turn failed: {detail}")})),
-        );
+    fn cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
     }
 
-    fn cancel(&self) -> thread::JoinHandle<()> {
-        self.cancelled.store(true, Ordering::SeqCst);
-        let mut pids = vec![self.pid];
-        pids.extend(descendants(self.pid));
-        signal_groups(&pids, SIGTERM);
-        thread::spawn(move || {
-            thread::sleep(Duration::from_secs(5));
-            signal_groups(&pids, SIGKILL);
-        })
+    /// Owns Cursor's process: ends the turn when Cursor exits, when it hangs after its result or
+    /// goes silent, or when the user stops it. Only then does the next turn start.
+    fn supervise(&self, mut child: Child, output: Receiver<Value>, stderr: Receiver<String>) {
+        let mut outcome = None;
+        let mut events = Events::default();
+        let (mut ended, mut heard, mut silent) = (false, Instant::now(), false);
+        // Set once, at the final result or the end of output; later events never extend it.
+        let mut finish_by: Option<Instant> = None;
+        let tick = Duration::from_millis(200);
+        loop {
+            if ended {
+                thread::sleep(tick);
+            } else {
+                match output.recv_timeout(tick) {
+                    Ok(event) => {
+                        heard = Instant::now();
+                        if events.forward(&event) {
+                            outcome = Some(event);
+                            finish_by.get_or_insert(heard + EXIT_GRACE);
+                        }
+                    }
+                    Err(RecvTimeoutError::Timeout) => {}
+                    Err(RecvTimeoutError::Disconnected) => {
+                        ended = true;
+                        finish_by.get_or_insert(Instant::now() + EXIT_GRACE);
+                    }
+                }
+            }
+            if self.cancelled() || matches!(child.try_wait(), Ok(Some(_)) | Err(_)) {
+                break;
+            }
+            if finish_by.is_some_and(|at| Instant::now() >= at) {
+                // Cursor never exited: end it, and its tools too if the user stops meanwhile.
+                stop(&mut child, &self.baseline, false, &|| self.cancelled());
+                break;
+            }
+            if events.tools == 0 && heard.elapsed() > SILENCE {
+                silent = true;
+                stop(&mut child, &self.baseline, true, &|| false);
+                break;
+            }
+        }
+        let mut stopped = self.cancelled();
+        if stopped {
+            stop(&mut child, &self.baseline, true, &|| false);
+        }
+        // One deadline for Cursor's last output and its stderr; a stop arriving meanwhile cuts it short.
+        let deadline = Instant::now() + if stopped { STOPPED_DRAIN } else { DRAIN };
+        let left = || {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .min(Duration::from_millis(100))
+        };
+        while !ended && Instant::now() < deadline && (stopped || !self.cancelled()) {
+            match output.recv_timeout(left()) {
+                Ok(event) => {
+                    if events.forward(&event) {
+                        outcome = Some(event);
+                    }
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => ended = true,
+            }
+        }
+        drop(output);
+        let mut stderr_text = String::new();
+        while Instant::now() < deadline && (stopped || !self.cancelled()) {
+            if let Ok(text) = stderr.recv_timeout(left()) {
+                stderr_text = text;
+                break;
+            }
+        }
+        // A stop that arrived while the turn was finishing still ends every tool before the reply.
+        if self.cancelled() && !stopped {
+            stop(&mut child, &self.baseline, true, &|| false);
+            stopped = true;
+        }
+        let status = child.try_wait().ok().flatten();
+        STATE.lock().unwrap().turn = None;
+        let verdict = if stopped {
+            Ok(json!({"stopReason":"cancelled"}))
+        } else {
+            verdict(outcome, status, &stderr_text, silent)
+        };
+        reply(&self.request, verdict);
     }
+
+    /// Stops the turn. The supervisor ends Cursor and its tools before it reports the stop.
+    fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+    }
+
+    fn wait(&self) {
+        if let Some(supervisor) = self.supervisor.lock().unwrap().take() {
+            let _ = supervisor.join();
+        }
+    }
+}
+
+/// Forwards one turn's events as ACP updates and counts running tools.
+#[derive(Default)]
+struct Events {
+    segment: String,
+    tools: usize,
+}
+
+impl Events {
+    /// Forwards `event`; returns whether it is the turn's final result.
+    fn forward(&mut self, event: &Value) -> bool {
+        self.segment = translate(event, std::mem::take(&mut self.segment));
+        match (event["type"].as_str(), event["subtype"].as_str()) {
+            (Some("tool_call"), Some("started")) => self.tools += 1,
+            (Some("tool_call"), Some("completed")) => self.tools = self.tools.saturating_sub(1),
+            (Some("result"), _) => return true,
+            _ => {}
+        }
+        false
+    }
+}
+
+/// Drops terminal color codes such as `\x1b[33m`.
+fn without_colors(text: &str) -> String {
+    let mut plain = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            chars.by_ref().find(|c| c.is_ascii_alphabetic());
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
+}
+
+fn verdict(
+    outcome: Option<Value>,
+    status: Option<std::process::ExitStatus>,
+    stderr: &str,
+    silent: bool,
+) -> Result<Value, Value> {
+    let outcome = outcome.unwrap_or_default();
+    // A finished turn ends with a successful result; the work is done even if Cursor then exits badly.
+    if outcome["subtype"] == "success" && !truthy(&outcome["is_error"]) {
+        return Ok(json!({"stopReason":"end_turn"}));
+    }
+    let detail = match &outcome["result"] {
+        result if truthy(result) => text(result),
+        _ if silent => format!("no output for {} minutes", SILENCE.as_secs() / 60),
+        // Cursor's error leads stderr; long ones list every model after it.
+        _ if !stderr.trim().is_empty() => {
+            let plain = without_colors(stderr);
+            let stderr = plain.trim();
+            let short: String = stderr.chars().take(300).collect();
+            if short.len() < stderr.len() {
+                short + "…"
+            } else {
+                short
+            }
+        }
+        _ => match status.map(|s| s.code().unwrap_or_else(|| -s.signal().unwrap_or(0))) {
+            Some(code) if code != 0 => format!("exit code {code}"),
+            _ => "no final result".to_owned(),
+        },
+    };
+    Err(json!({"code":-32603,"message":detail}))
 }
 
 fn translate(event: &Value, segment: String) -> String {
@@ -392,9 +691,7 @@ fn handle(message: &Value) {
             ),
             "session/new" => {
                 let cwd = field("cwd")?;
-                let created = cli(&["create-chat"], cwd)?;
-                let session = created.trim().lines().last().unwrap_or_default();
-                open_session(request, session, cwd)?;
+                open_session(request, &create_chat(cwd)?, cwd)?;
             }
             "session/load" => open_session(request, field("sessionId")?, field("cwd")?)?,
             "session/set_config_option" if params["configId"] == "model" => {

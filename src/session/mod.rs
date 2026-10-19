@@ -301,7 +301,7 @@ pub struct Manager {
     local: Arc<Mutex<Local>>,
     history: history::History,
     pub(crate) observability: Observability,
-    pub(crate) storage: Guard,
+    pub(crate) storage: Arc<Guard>,
     pub(crate) workspaces: crate::workspace::Workspaces,
     pub(crate) sync: crate::sync::Sync,
     pub(crate) previews: Arc<crate::preview::Previews>,
@@ -382,7 +382,7 @@ impl Manager {
             }
         }
         // Native recovery runs helpers (Cursor capture) inside the agent cgroup, so prepare it first.
-        let storage = Guard::new(&config)?;
+        let storage = Arc::new(Guard::new(&config)?);
         for session in local.sessions.values().cloned().collect::<Vec<_>>() {
             if let Some(saved) = session.resume()
                 && let Some(profile) = config.harnesses.get(&session.harness)
@@ -457,16 +457,47 @@ impl Manager {
         }))
     }
 
-    /// The session whose live harness process is one of `pids`.
+    /// The session whose live harness process is one of `pids`, the caller and its ancestors.
     pub(crate) fn harness_session(&self, pids: &[u32]) -> Option<String> {
         let local = self.local.lock().unwrap();
-        pids.iter().find_map(|pid| {
+        let direct = pids.iter().find_map(|pid| {
             local
                 .sessions
                 .values()
                 .find(|s| s.handle.as_ref().is_some_and(|h| h.pid() == *pid))
                 .map(|s| s.session_id.clone())
-        })
+        });
+        // OpenClaw runs every session's tools under its shared Gateway: the caller belongs to the OpenClaw
+        // session running a turn, or, with several, to the one whose folder the caller works in.
+        if direct.is_some() || !runtime::openclaw_gateway_pid().is_some_and(|g| pids.contains(&g)) {
+            return direct;
+        }
+        let busy: Vec<_> = local
+            .sessions
+            .values()
+            .filter(|s| {
+                s.harness == runtime::Kind::OpenClaw
+                    && s.handle.is_some()
+                    && s.current_request.is_some()
+            })
+            .collect();
+        let cwd = std::fs::read_link(format!("/proc/{}/cwd", pids.first()?)).ok();
+        let within = |s: &&&Session| {
+            let folder = s
+                .workspace
+                .as_ref()
+                .and_then(|w| w.path.canonicalize().ok());
+            cwd.as_ref()
+                .zip(folder)
+                .is_some_and(|(cwd, folder)| cwd.starts_with(folder))
+        };
+        match busy.as_slice() {
+            [only] => Some(only.session_id.clone()),
+            _ => match busy.iter().filter(within).collect::<Vec<_>>().as_slice() {
+                [only] => Some(only.session_id.clone()),
+                _ => None,
+            },
+        }
     }
 
     /// Appends a record that no harness produced, such as a secret request.
@@ -668,6 +699,7 @@ impl Manager {
             runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::Hermes => runtime::HERMES_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::Devin => runtime::DEVIN_REASONING_LEVELS.contains(&reasoning),
+            runtime::Kind::OpenClaw => runtime::OPENCLAW_REASONING_LEVELS.contains(&reasoning),
         };
         if !supported {
             return Err(Error::Conflict("invalid reasoning effort"));
@@ -876,6 +908,9 @@ impl Manager {
         let result = async {
             let workspace = workspace.ok_or_else(|| io::Error::other("session workspace missing"))?;
             self.workspaces.ensure_directory(&workspace).await?;
+            failure_reason = "The harness could not prepare its shared service";
+            let kind = self.local.lock().unwrap().sessions[&id].harness;
+            runtime::prepare(&self.config, kind, &self.storage).await?;
             failure_reason = "Harness initialization failed; inspect native history and protected local harness diagnostics for this session";
             let fork;
             let (handle, events) = {
@@ -1828,6 +1863,8 @@ impl Manager {
                 }
                 tokio::time::sleep(Duration::from_millis(100)).await;
             }
+            let kind = self.local.lock().unwrap().sessions[&id].harness;
+            runtime::prepare(&self.config, kind, &self.storage).await?;
             let previous = self.local.lock().unwrap().sessions[&id].harness_pid;
             if self.config.storage.is_none()
                 && let Some(pid) = previous
@@ -2295,6 +2332,7 @@ impl Manager {
                     break;
                 }
             }
+            runtime::shutdown().await;
             // The harnesses' last records, then diagnostics. A drain already saved the rest; systemd waits 10 s.
             self.flush_history(Duration::from_secs(2)).await;
             self.observability.shutdown().await;

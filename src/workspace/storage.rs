@@ -261,14 +261,25 @@ impl Guard {
     }
     /// Frozen work never frees space. Once Cloudroom has stopped the command filling the disk, work continues
     /// until half of the space left is used, then pauses again. Space above `resume_bytes` ends the rescue.
-    pub fn rescue(&self) {
+    /// The pause line never drops below an eighth of `pause_bytes` (250 MB on a 20 GB box), so agents can't fill
+    /// the space Core needs to save history. Returns false at that line: work stays paused until space is freed.
+    pub fn rescue(&self) -> bool {
         let (snapshot, _) = &*self.value.lock().unwrap();
-        if let (Some(workspace), Some(history)) = (
+        let (Some(workspace), Some(history)) = (
             snapshot.workspace_available_bytes,
             snapshot.history_available_bytes,
-        ) {
-            *self.floor.lock().unwrap() = Some(workspace.min(history) / 2);
+        ) else {
+            return false;
+        };
+        let (available, minimum) = (
+            workspace.min(history),
+            self.policy.as_ref().map_or(0, |p| p.pause_bytes / 8),
+        );
+        if available <= minimum {
+            return false;
         }
+        *self.floor.lock().unwrap() = Some((available / 2).max(minimum));
+        true
     }
     pub(crate) fn spawn_writer(
         &self,
@@ -680,8 +691,23 @@ mod tests {
                 Instant::now(),
             )),
         };
-        guard.rescue();
+        assert!(guard.rescue());
         assert_eq!(*guard.floor.lock().unwrap(), floor);
+        // A 20 GB box's pause line stops at 250 MB, and work stays paused below it.
+        let guard = Guard {
+            policy: Some(policy),
+            ..guard
+        };
+        for (available, rescued, floor) in [
+            (400_000_000, true, Some(250_000_000)),
+            (250_000_000, false, Some(250_000_000)),
+            (4_000_000, false, Some(250_000_000)),
+        ] {
+            guard.value.lock().unwrap().0.workspace_available_bytes = Some(available);
+            guard.value.lock().unwrap().0.history_available_bytes = Some(available);
+            assert_eq!(guard.rescue(), rescued, "{available} bytes");
+            assert_eq!(*guard.floor.lock().unwrap(), floor);
+        }
     }
 
     #[test]

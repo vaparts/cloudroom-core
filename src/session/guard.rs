@@ -4,6 +4,8 @@ use crate::workspace::storage::FRESH;
 
 /// How long work stays frozen before Cloudroom stops the command filling the disk.
 const RESCUE_AFTER: Duration = Duration::from_secs(30);
+/// A command that wrote less than this is not filling the disk, so it is never stopped.
+const RESCUE_MIN_BYTES: u64 = 32_000_000;
 /// History uploads wait this long for more records, so a busy session sends one file per half minute.
 const UPLOAD_AFTER: Duration = Duration::from_secs(30);
 /// ...unless this many records wait already.
@@ -178,10 +180,14 @@ impl Manager {
         });
     }
 
-    /// Frozen work never frees space, so a pause could last forever. Stops the command filling the disk in
-    /// each session and tells its agent to clean up. The lowered threshold (`Guard::rescue`) then lets the
-    /// guard loop thaw everything.
+    /// Frozen work never frees space, so a pause could last forever. Stops the one command in the sandbox that
+    /// wrote the most, and tells every agent to clean up. The lowered threshold (`Guard::rescue`) then lets the
+    /// guard loop thaw everything; a writer that keeps filling the disk is stopped on the next rescue. At the
+    /// lowest pause line there is no rescue: work stays paused so history can still be saved.
     async fn rescue(&self) {
+        if !self.storage.rescue() {
+            return;
+        }
         let handles: Vec<_> = self
             .local
             .lock()
@@ -190,10 +196,20 @@ impl Manager {
             .values()
             .filter_map(|s| s.handle.clone().map(|h| (s.session_id.clone(), h)))
             .collect();
-        self.storage.rescue();
+        // Agents share one disk, and files from finished commands stay when a running one stops, so the
+        // heaviest writer across all sessions goes, and only if it wrote enough to matter.
+        let culprit = handles
+            .iter()
+            .filter_map(|(id, handle)| Some((id, handle.top_writer().ok().flatten()?)))
+            .filter(|(_, writer)| writer.bytes >= RESCUE_MIN_BYTES)
+            .max_by_key(|(_, writer)| writer.bytes)
+            .map(|(id, writer)| {
+                writer.kill();
+                (id.clone(), writer.command)
+            });
         for (id, handle) in handles {
-            let text = match handle.kill_top_writer() {
-                Ok(Some(command)) => {
+            let text = match &culprit {
+                Some((owner, command)) if *owner == id => {
                     let command: String = command.replace('`', "'").chars().take(160).collect();
                     format!(
                         "Cloudroom: the disk is full, so Cloudroom stopped `{command}`, which was filling it. Free space before continuing: delete files you no longer need, like build output, caches, or node_modules, and check with `df -h`. Do not rerun that command as is."
@@ -231,7 +247,8 @@ impl Manager {
         }
         let manager = self.clone();
         tokio::spawn(async move {
-            let (mut since, mut failures, mut retry_at) = (None::<Instant>, 0u32, Instant::now());
+            let (mut since, mut failures, mut retry_at, mut faulted) =
+                (None::<Instant>, 0u32, Instant::now(), false);
             loop {
                 let asked = tokio::select! {
                     _ = manager.uploads.notified() => true,
@@ -254,44 +271,43 @@ impl Manager {
                 if !due || (!asked && Instant::now() < retry_at) {
                     continue;
                 }
-                let batch = match manager.upload_batch() {
-                    Ok(batch) => batch,
-                    Err(_) => {
-                        manager.observability.record(Signal::HistoryFault {
-                            operation: "read_pending",
+                let started = Instant::now();
+                // A full disk fails local reads and writes for a while. They back off and retry like a failed upload,
+                // so saving resumes once there is space (feedback #669).
+                let outcome = match manager.upload_batch() {
+                    Err(_) => Err(Some("read_pending")),
+                    Ok(batch) => {
+                        let result = manager.history.upload(&batch).await;
+                        let mut local = manager.local.lock().unwrap();
+                        local.database_available = result.is_ok();
+                        let ack_failed = result.is_ok()
+                            && local
+                                .journal
+                                .acknowledge(batch.last().unwrap().sequence)
+                                .is_err();
+                        manager.observability.record(Signal::HistoryUpload {
+                            records: batch.len(),
+                            pending_records: local.journal.last() - local.journal.saved(),
+                            success: result.is_ok(),
+                            duration_ms: elapsed_ms(started),
                         });
-                        break;
+                        match result {
+                            Ok(()) if ack_failed => Err(Some("acknowledge")),
+                            Ok(()) => Ok(()),
+                            Err(history::ApiError::Conflict) => Err(Some("conflict")),
+                            Err(_) => Err(None),
+                        }
                     }
                 };
-                let started = Instant::now();
-                let result = manager.history.upload(&batch).await;
-                let mut local = manager.local.lock().unwrap();
-                local.database_available = result.is_ok();
-                let ack_failed = result.is_ok()
-                    && local
-                        .journal
-                        .acknowledge(batch.last().unwrap().sequence)
-                        .is_err();
-                manager.observability.record(Signal::HistoryUpload {
-                    records: batch.len(),
-                    pending_records: local.journal.last() - local.journal.saved(),
-                    success: result.is_ok(),
-                    duration_ms: elapsed_ms(started),
-                });
-                drop(local);
-                if ack_failed {
-                    manager.observability.record(Signal::HistoryFault {
-                        operation: "acknowledge",
-                    });
-                    break;
-                }
-                match result {
-                    Ok(()) => (since, failures) = (None, 0),
-                    Err(error) => {
-                        if matches!(error, history::ApiError::Conflict) {
-                            manager.observability.record(Signal::HistoryFault {
-                                operation: "conflict",
-                            });
+                match outcome {
+                    Ok(()) => (since, failures, faulted) = (None, 0, false),
+                    Err(fault) => {
+                        // Once per run of failures, not on every retry.
+                        if let Some(operation) = fault.filter(|_| !faulted) {
+                            manager
+                                .observability
+                                .record(Signal::HistoryFault { operation });
+                            faulted = true;
                         }
                         failures += 1;
                         // 1, 2, 4 ... 60 s, with up to a second of jitter so a fleet doesn't retry in step.

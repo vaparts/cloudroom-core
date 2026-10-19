@@ -61,14 +61,20 @@ fn gaps_and_uncertain_writes_fail_closed() {
     let dir = Directory::new();
     let mut journal = Journal::open(&dir.0).unwrap();
     journal.append(b"preserved").unwrap();
+    // A write that fails before its rename (a full disk) changes nothing, so the next write may go ahead.
     fs::create_dir(dir.0.join("pending.tmp")).unwrap();
     assert!(journal.append(b"failed").is_err());
     fs::remove_dir(dir.0.join("pending.tmp")).unwrap();
+    assert_eq!(journal.append(b"second").unwrap(), 2);
+    // A failed rename has an uncertain outcome: nothing is written until the journal is reopened.
+    fs::create_dir(dir.0.join("00000000000000000003.record")).unwrap();
+    assert!(journal.append(b"failed").is_err());
+    fs::remove_dir(dir.0.join("00000000000000000003.record")).unwrap();
     assert!(journal.append(b"must not retry silently").is_err());
     drop(journal);
     let mut journal = Journal::open(&dir.0).unwrap();
     assert_eq!(journal.read(1).unwrap(), b"preserved");
-    assert_eq!(journal.append(b"explicit recovery").unwrap(), 2);
+    assert_eq!(journal.append(b"explicit recovery").unwrap(), 3);
     drop(journal);
     fs::remove_file(dir.0.join("00000000000000000001.record")).unwrap();
     assert!(Journal::open(&dir.0).is_err());

@@ -27,6 +27,7 @@ mod files;
 mod fx;
 mod hermes;
 pub(crate) mod linux;
+mod openclaw;
 mod opencode;
 mod pi;
 pub(crate) mod pi_auth;
@@ -51,6 +52,8 @@ pub enum Kind {
     OpenCode,
     Hermes,
     Devin,
+    #[serde(rename = "openclaw")]
+    OpenClaw,
 }
 impl Kind {
     /// Harnesses that accept a per-turn `fast` service tier. Claude Fast stays off (ADR 0133).
@@ -110,8 +113,28 @@ pub fn pi_reasoning_accepted(level: &str) -> bool {
 }
 pub use devin::REASONING_LEVELS as DEVIN_REASONING_LEVELS;
 pub use hermes::REASONING_LEVELS as HERMES_REASONING_LEVELS;
+pub use openclaw::REASONING_LEVELS as OPENCLAW_REASONING_LEVELS;
 pub use opencode::REASONING_LEVELS as OPENCODE_REASONING_LEVELS;
 pub use opencode::import as import_opencode;
+
+/// Readies what a harness shares between sessions before one starts: OpenClaw's Gateway.
+pub async fn prepare(
+    config: &Config,
+    kind: Kind,
+    storage: &Arc<crate::workspace::storage::Guard>,
+) -> io::Result<()> {
+    match kind {
+        Kind::OpenClaw => openclaw::prepare(config, storage).await,
+        _ => Ok(()),
+    }
+}
+
+/// Stops what `prepare` started, once every session has closed.
+pub async fn shutdown() {
+    openclaw::stop().await;
+}
+
+pub use openclaw::gateway_pid as openclaw_gateway_pid;
 
 pub async fn claude_auth_ready(config: &Config) -> io::Result<bool> {
     claude::auth_ready(config).await
@@ -345,6 +368,8 @@ pub struct Handle {
     baseline: Arc<Mutex<Option<String>>>,
     /// ACP agent capabilities from `initialize`; empty for other harnesses.
     acp: Arc<Mutex<Value>>,
+    /// The ACP session's latest config options (model, effort); only fx keeps them.
+    acp_config: Arc<Mutex<Value>>,
     rpc_timeout: Duration,
     command_guard_enabled: bool,
     strip_ai_co_authors: bool,
@@ -534,6 +559,17 @@ impl Handle {
                 None,
                 None,
             ),
+            Kind::OpenClaw => (
+                openclaw::command(config, &profile)?,
+                Box::new(cursor::Protocol::new(
+                    config,
+                    &profile,
+                    resume.as_ref(),
+                    openclaw::OPENCLAW,
+                )),
+                None,
+                None,
+            ),
             Kind::Pi => {
                 let (command, path, helper) = pi::command(
                     config,
@@ -570,6 +606,7 @@ impl Handle {
                 reasoning: resume.as_ref().and_then(|saved| saved.reasoning.clone()),
                 baseline: Arc::new(Mutex::new(None)),
                 acp: Arc::new(Mutex::new(Value::Null)),
+                acp_config: Arc::new(Mutex::new(Value::Null)),
                 rpc_timeout: config.rpc_timeout,
                 command_guard_enabled,
                 strip_ai_co_authors,
@@ -631,7 +668,7 @@ impl Handle {
     pub fn capabilities(&self) -> Value {
         if matches!(
             self.kind,
-            Kind::Cursor | Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin
+            Kind::Cursor | Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin | Kind::OpenClaw
         ) {
             return cursor::capabilities(self.kind);
         }
@@ -651,6 +688,7 @@ impl Handle {
             Kind::OpenCode => opencode::start(&startup).await,
             Kind::Hermes => hermes::start(&startup).await,
             Kind::Devin => devin::start(&startup).await,
+            Kind::OpenClaw => openclaw::start(&startup).await,
         }
     }
     /// Starts a `spawn_fork` harness and returns the side chat's new native ID.
@@ -662,8 +700,15 @@ impl Handle {
         startup.rpc_timeout = self.rpc_timeout * STARTUP_RPC_MULTIPLIER;
         codex::start(&startup, Some(fork)).await
     }
-    /// Pi confirms the turn's thinking level before the prompt. Codex sends effort with turn/start.
+    /// Pi confirms the turn's thinking level and fx switches its effort before the prompt.
+    /// Codex sends effort with turn/start.
     pub async fn prepare_turn(&self) -> io::Result<()> {
+        if self.kind == Kind::OpenClaw {
+            return openclaw::refresh(self).await;
+        }
+        if self.kind == Kind::Fx {
+            return fx::prepare_turn(self).await;
+        }
         if self.kind == Kind::Pi
             && let Some(reasoning) = &self.reasoning
         {
@@ -682,7 +727,7 @@ impl Handle {
             Kind::Codex => codex::send(self, request, input).await.map(|()| Vec::new()),
             Kind::Pi => pi::send(self, request, input).await.map(|()| Vec::new()),
             Kind::Claude => claude::send(self, request, input).await,
-            Kind::Cursor | Kind::OpenCode | Kind::Hermes | Kind::Devin => {
+            Kind::Cursor | Kind::OpenCode | Kind::Hermes | Kind::Devin | Kind::OpenClaw => {
                 cursor::send(self, request, input)
                     .await
                     .map(|()| Vec::new())
@@ -702,7 +747,7 @@ impl Handle {
             Kind::Codex => codex::steer(self, state, text).await,
             Kind::Pi => pi::steer(self, request, text).await,
             Kind::Claude => claude::steer(self, request, text).await,
-            Kind::Cursor | Kind::OpenCode | Kind::Hermes | Kind::Devin => {
+            Kind::Cursor | Kind::OpenCode | Kind::Hermes | Kind::Devin | Kind::OpenClaw => {
                 cursor::steer(self, request, text).await
             }
             Kind::Fx => fx::steer(self, request, text).await,
@@ -713,12 +758,15 @@ impl Handle {
             Kind::Codex => codex::compact(self).await,
             Kind::Pi => pi::compact(self).await,
             Kind::Claude => claude::compact(self).await,
-            Kind::Cursor | Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin => {
-                Err(io::Error::new(
-                    io::ErrorKind::InvalidInput,
-                    "ACP compaction is not supported",
-                ))
-            }
+            Kind::Cursor
+            | Kind::Fx
+            | Kind::OpenCode
+            | Kind::Hermes
+            | Kind::Devin
+            | Kind::OpenClaw => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ACP compaction is not supported",
+            )),
         }
     }
     /// Sets, pauses, resumes, or clears the harness's durable goal as the user.
@@ -738,9 +786,15 @@ impl Handle {
             Kind::Claude => Err(io::Error::other(
                 "Claude rewind requires native process replacement",
             )),
-            Kind::Cursor | Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin => Err(
-                io::Error::new(io::ErrorKind::InvalidInput, "ACP rewind is not supported"),
-            ),
+            Kind::Cursor
+            | Kind::Fx
+            | Kind::OpenCode
+            | Kind::Hermes
+            | Kind::Devin
+            | Kind::OpenClaw => Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "ACP rewind is not supported",
+            )),
         }
     }
     pub fn rewind_replacement(
@@ -819,7 +873,12 @@ impl Handle {
                 .filter(|usage| !usage.is_null())),
             Kind::Pi => pi::usage(self).await,
             Kind::Claude => Ok(Some(self.process.progress.borrow().last_usage.clone())),
-            Kind::Cursor | Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin => Ok(None),
+            Kind::Cursor
+            | Kind::Fx
+            | Kind::OpenCode
+            | Kind::Hermes
+            | Kind::Devin
+            | Kind::OpenClaw => Ok(None),
         }
     }
     pub async fn interrupt(&self, request: &str) -> io::Result<()> {
@@ -834,9 +893,12 @@ impl Handle {
             Kind::Codex => codex::interrupt(self, state).await,
             Kind::Pi => pi::interrupt(self, request).await,
             Kind::Claude => claude::interrupt(self, request).await,
-            Kind::Cursor | Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin => {
-                cursor::interrupt(self, state).await
-            }
+            Kind::Cursor
+            | Kind::Fx
+            | Kind::OpenCode
+            | Kind::Hermes
+            | Kind::Devin
+            | Kind::OpenClaw => cursor::interrupt(self, state).await,
         }
     }
     pub async fn system_message(&self, text: &str) -> io::Result<()> {
@@ -844,20 +906,23 @@ impl Handle {
             Kind::Codex => codex::notice(self, text).await,
             Kind::Pi => pi::notice(self, text).await,
             Kind::Claude => claude::notice(self, text).await,
-            Kind::Cursor | Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin => {
-                Err(io::Error::new(
-                    io::ErrorKind::Unsupported,
-                    "ACP context-only notices are unavailable",
-                ))
-            }
+            Kind::Cursor
+            | Kind::Fx
+            | Kind::OpenCode
+            | Kind::Hermes
+            | Kind::Devin
+            | Kind::OpenClaw => Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "ACP context-only notices are unavailable",
+            )),
         }
     }
     pub async fn pause(&self, paused: bool) -> io::Result<()> {
         self.process.pause(paused).await
     }
-    /// Stops the tool command filling the disk; see `linux::Workload::kill_top_writer`.
-    pub fn kill_top_writer(&self) -> io::Result<Option<String>> {
-        self.process.kill_top_writer()
+    /// The tool command that wrote the most to disk; see `linux::Workload::top_writer`.
+    pub fn top_writer(&self) -> io::Result<Option<linux::Writer>> {
+        self.process.top_writer()
     }
     pub fn request_shutdown(&self) {
         self.process.request_shutdown();
@@ -890,6 +955,7 @@ pub fn check_resume_history(
         Kind::OpenCode => return opencode::validate(profile, saved, identity),
         Kind::Hermes => return hermes::validate(profile, saved, identity),
         Kind::Devin => return devin::validate(profile, saved, identity),
+        Kind::OpenClaw => return openclaw::validate(profile, saved, identity),
         _ => {}
     }
     let file = files::open(
@@ -924,11 +990,14 @@ pub fn recover_records(
         Kind::OpenCode => {
             opencode::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid)))
         }
-        // Hermes and Devin keep their sessions in their own databases; Cloudroom stores the ACP stream only.
+        // Hermes, Devin, and OpenClaw keep their sessions in their own databases; Cloudroom stores the ACP stream only.
         Kind::Hermes => {
             hermes::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid)))
         }
         Kind::Devin => devin::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid))),
+        Kind::OpenClaw => {
+            openclaw::validate(profile, saved, policy.map(|p| (p.agent_uid, p.agent_gid)))
+        }
         Kind::Codex => codex::recover(
             profile,
             saved,
@@ -968,7 +1037,7 @@ pub fn checkpoint(
         Kind::Codex | Kind::Claude => files::checkpoint(previous, data, native),
         Kind::Pi => pi::checkpoint(data, native),
         Kind::Cursor => cursor::checkpoint(previous, data, native),
-        Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin => {
+        Kind::Fx | Kind::OpenCode | Kind::Hermes | Kind::Devin | Kind::OpenClaw => {
             Err(io::Error::other("ACP stream has no native records"))
         }
     }
