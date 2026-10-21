@@ -389,7 +389,7 @@ impl Adapter for Protocol {
                 || id.len() > 48
                 || !id.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
                 || prompt.trim().is_empty()
-                || prompt.len() > 32768
+                || prompt.len() > crate::session::MAX_PROMPT
             {
                 return Err(io::Error::other("invalid child request"));
             }

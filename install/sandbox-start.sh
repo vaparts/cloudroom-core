@@ -38,6 +38,9 @@ cache=$(sed -n 's/.*"cache_dir":"\([^"]*\)".*/\1/p' "$config/storage.json")
 install -d -m 0711 -o cloudroom -g cloudroom /run/cloudroom
 install -d -m 0700 -o cloudroom-agent -g cloudroom-agent "$cache"
 install -d -m 0750 -o root -g cloudroom "$log"
+# No GPU: Chromium composites pages on the CPU, not through Mesa's software GPU, where one idle animated page used
+# whole CPUs. WebGL still renders through Mesa. Debian's chromium launcher reads /etc/chromium.d.
+[ ! -d /etc/chromium.d ] || echo 'export CHROMIUM_FLAGS="$CHROMIUM_FLAGS --disable-gpu-compositing"' > /etc/chromium.d/cloudroom
 
 supervise() {
   local caps=-all,+setuid,+setgid,+dac_read_search,+kill delay=1 identity=(--reuid=cloudroom --regid=cloudroom --init-groups)

@@ -36,6 +36,18 @@ struct Derived {
     close_request: Option<String>,
     harness_pid: Option<u32>,
     usage_limited: bool,
+    #[serde(default)]
+    usage_resets_ms: Option<u64>,
+    #[serde(default)]
+    resume_loop: Option<String>,
+    #[serde(default)]
+    resume_spent: Vec<String>,
+    #[serde(default)]
+    limit_episode: u64,
+    #[serde(default)]
+    limit_resumes: u32,
+    #[serde(default)]
+    resume_refused: bool,
 }
 
 impl Derived {
@@ -52,6 +64,12 @@ impl Derived {
             close_request: s.close_request.clone(),
             harness_pid: s.harness_pid,
             usage_limited: s.usage_limited,
+            usage_resets_ms: s.usage_resets_ms,
+            resume_loop: s.resume_loop.clone(),
+            resume_spent: s.resume_spent.clone(),
+            limit_episode: s.limit_episode,
+            limit_resumes: s.limit_resumes,
+            resume_refused: s.resume_refused,
         }
     }
 
@@ -67,6 +85,12 @@ impl Derived {
         s.close_request = self.close_request;
         s.harness_pid = self.harness_pid;
         s.usage_limited = self.usage_limited;
+        s.usage_resets_ms = self.usage_resets_ms;
+        s.resume_loop = self.resume_loop;
+        s.resume_spent = self.resume_spent;
+        s.limit_episode = self.limit_episode;
+        s.limit_resumes = self.limit_resumes;
+        s.resume_refused = self.resume_refused;
     }
 }
 
@@ -364,6 +388,16 @@ impl Local {
                         session.queue.push(receipt.request_id.clone());
                         session.recovery_attempted = false; // A new user request permits one recovery.
                         session.usage_limited = false;
+                        session.usage_resets_ms = None;
+                        // Only the resume loop's own prompt counts toward the cap, not a notice, switch, or user's.
+                        if session.resume_loop.as_deref().is_some_and(|id| {
+                            super::accounts::loop_request(id, &receipt.request_id)
+                        }) {
+                            session.limit_resumes += 1;
+                        }
+                        // Any accepted prompt ends this limit: its loop retires now, so a limit that hits again
+                        // at once gets a loop with its own schedule, never this one.
+                        session.resume_spent.extend(session.resume_loop.take());
                     }
                     if !matches!(receipt.state.as_str(), "accepted" | "running" | "delivered") {
                         session.queue.retain(|id| id != &receipt.request_id);
@@ -372,6 +406,9 @@ impl Local {
                     }
                     if matches!(receipt.state.as_str(), "completed" | "interrupted") {
                         session.recovery_attempted = false; // Healthy progress permits a later recovery.
+                    }
+                    if receipt.state == "completed" {
+                        session.limit_resumes = 0;
                     }
                 }
                 if receipt.command == "cancel"
@@ -488,6 +525,11 @@ impl Local {
                 {
                     session.has_dispatched = true;
                     session.queue.retain(|id| id != request);
+                    // A newer turn runs: an earlier turn's limit no longer stops the thread, even if that limit was
+                    // recorded after this prompt was accepted (queued behind it). Its loop retires now.
+                    session.usage_limited = false;
+                    session.usage_resets_ms = None;
+                    session.resume_spent.extend(session.resume_loop.take());
                 }
             }
             "enqueue" => {} // Legacy queue membership is already reconstructed from its receipt.
@@ -552,7 +594,35 @@ impl Local {
                     session.reported.insert(request.to_owned());
                 }
             }
-            "usage_limited" => session.usage_limited = true,
+            "usage_limited" => {
+                session.usage_limited = true;
+                session.usage_resets_ms = record.data["resets_at_ms"].as_u64();
+                session.resume_refused = false;
+                session.limit_episode += 1;
+            }
+            // A website loop that resumes the thread at the reset: made (`id`), removed (`deleted`), or not possible
+            // (`failed`), for the limit `episode`. One that answers for an earlier limit, or none, retires at once.
+            "resume_loop" => {
+                let current = record.data["episode"]
+                    .as_u64()
+                    .is_none_or(|e| e == session.limit_episode)
+                    && session.usage_limited;
+                if let Some(gone) = record.data["deleted"].as_str() {
+                    session.resume_spent.retain(|id| id != gone);
+                    if session.resume_loop.as_deref() == Some(gone) {
+                        session.resume_loop = None;
+                    }
+                } else if let Some(id) = record.data["id"].as_str() {
+                    if current && session.resume_loop.is_none() {
+                        session.resume_loop = Some(id.to_owned());
+                    } else if session.resume_loop.as_deref() != Some(id) {
+                        session.resume_spent.push(id.to_owned());
+                    }
+                }
+                if record.data["failed"].is_string() && current {
+                    session.resume_refused = true;
+                }
+            }
             "storage_warning" => session.storage_warned = true,
             "storage_pause" => session.storage_paused = record.data["paused"] == true,
             "storage_recovered" => {
@@ -662,7 +732,9 @@ mod tests {
                 "state",
                 json!({"state":"failed","reason":"boom","stderr":"trace"}),
             ),
-            ("b", "usage_limited", json!({})),
+            ("b", "usage_limited", json!({"resets_at_ms":1})),
+            ("b", "resume_loop", json!({"id":"loop"})),
+            ("b", "resume_loop", json!({"deleted":"loop"})),
             ("b", "state", json!({"state":"resuming","recovery":true})),
         ];
         for (i, (id, kind, data)) in records.into_iter().enumerate() {

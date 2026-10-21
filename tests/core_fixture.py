@@ -109,10 +109,18 @@ def codex():
                 if text == "no-reply":
                     Path("no-reply").touch()
                     continue
-                if text == "delay":
+                if text in ("delay", "limit-delay"):
                     while not Path("release").exists():
                         time.sleep(.02)
                 turn = str(uuid.uuid4())
+                if text == "limit-delay":
+                    # Ends like Codex's plan limit, resetting in 2 minutes.
+                    send({"id": message["id"], "result": {"turn": {"id": turn}}})
+                    event("turn/started", turn={"id": turn, "status": "inProgress"})
+                    window = {"usedPercent": 100, "windowDurationMins": 300, "resetsAt": int(time.time()) + 120}
+                    event("account/rateLimits/updated", rateLimits={"limitId": "codex", "primary": window})
+                    event("turn/completed", turn={"id": turn, "status": "failed", "error": {"message": "You've hit your usage limit.", "codexErrorInfo": "usageLimitExceeded"}})
+                    continue
                 reply = {"id": message["id"], "result": {"turn": {"id": turn}}}
                 if text == "reply-first":
                     send(reply)
@@ -219,7 +227,7 @@ class ReplayTests(unittest.TestCase):
         home = self.root / "home"
         (home / ".codex").mkdir(parents=True)
         self.state = self.root / "state"
-        self.state.mkdir()
+        self.state.mkdir(mode=0o700)  # Core rejects group-writable state, so permissive umasks must not leak in.
         # History stays in the journal unless a test starts the fake API (WorkspaceTests.api).
         self.env = {
             "PATH": "/usr/local/bin:/usr/bin:/bin", "CLOUDROOM_UNPROTECTED_TEST_MODE": "1", "CLOUDROOM_LISTEN": "127.0.0.1:0",
@@ -613,6 +621,39 @@ class RecoveryTests(unittest.TestCase):
     def ready(self):
         self.wait(lambda: self.status()["state"] == "idle", "resumed idle session")
         self.assertEqual(self.status()["native_id"], self.native)
+
+    def test_a_limit_ends_once_newer_queued_work_runs(self):
+        # The limit lands after newer work was queued behind its turn. Once that work runs, the earlier limit must
+        # neither keep a resume loop nor let one queue an unsolicited "keep working", while it runs or after.
+        from fake_api import FakeApi
+        api = FakeApi(self.env["CLOUDROOM_TOKEN"], self.env["CLOUDROOM_STORE"])
+        try:
+            self.env.pop("CLOUDROOM_LOCAL_HISTORY", None); self.env.update(api.env())
+            self.seed(); self.start(); self.ready()
+            loop = "00000000-0000-4000-8000-000000000000"  # The fake website's ID for every loop.
+            def resume(n):
+                text = f'[Cloudroom automation "Resume after Codex plan limit · cr_seed" due: {loop}]\n\nkeep working'
+                return self.service.request("POST", "/v1/sessions/cr_seed/prompts", {"request_id": f"auto_{loop.replace('-', '')}_{n}", "text": text}, 409)
+            for n, newer in [(1, "the newer user task"), (2, "no-reply")]:
+                (self.repo / "release").unlink(missing_ok=True)
+                self.prompt(f"limited{n}", "limit-delay")
+                self.wait(lambda: self.status()["current_request"] == f"limited{n}", "limited turn running")
+                self.prompt(f"newer{n}", newer)
+                self.assertIn(f"newer{n}", self.status()["queue"])
+                (self.repo / "release").touch()
+                self.wait(lambda: self.status()["receipts"][f"limited{n}"]["state"] == "failed", "limited turn failed")
+                self.assertIn("plan limit (not Cloudroom's)", self.status()["receipts"][f"limited{n}"]["error"])
+                if newer == "no-reply":
+                    self.wait(lambda: (self.repo / "no-reply").exists(), "newer turn running")
+                else:
+                    self.wait(lambda: self.status()["receipts"][f"newer{n}"]["state"] == "completed", "newer turn completed")
+                time.sleep(11)  # One resumer tick: any loop for the old limit must be gone again.
+                actions = [a["action"] for a in api.automations if a["action"] in ("create", "delete")]
+                self.assertEqual(actions.count("create"), actions.count("delete"), actions)
+                resume(n)
+                self.assertNotIn(f"auto_{loop.replace('-', '')}_{n}", self.status()["receipts"])
+        finally:
+            api.close()
 
     def test_malformed_rollout_does_not_poison_the_journal_or_service_restart(self):
         self.seed(); self.start(); self.ready()

@@ -15,6 +15,7 @@ import os
 from pathlib import Path
 import plistlib
 import pwd
+import random
 import select
 import shlex
 import signal
@@ -58,14 +59,32 @@ class ControlError(ValueError):
         super().__init__('Preview control returned HTTP ' + str(code))
 
 
-OPENER = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+# HTTPS settings. urllib reads the macOS proxy setting only when these are built, so the helper rebuilds them while it
+# can't connect: turning off a VPN or proxy then needs no restart (#109). Certificates come from Python's own OpenSSL
+# file, never the macOS Keychain.
+NET = {}
+NETWORK_SECONDS = 30
+# Wakes job streams waiting to retry when the app asks to check again.
+NUDGE = threading.Condition()
+# Proxies such as Cloudflare refuse urllib's default User-Agent, so the helper names itself on every request.
+USER_AGENT = 'Cloudroom-Helper'
+
+
+def network():
+    context, proxies = ssl.create_default_context(), urllib.request.getproxies()
+    opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler(proxies), urllib.request.HTTPSHandler(context=context))
+    opener.addheaders = [('User-Agent', USER_AGENT)]
+    NET.update(opener=opener, proxies=proxies, cas=context.cert_store_stats()['x509_ca'], at=time.monotonic())
+
+
+network()
 
 
 def control(url, body, method, headers, timeout=5):
     request = urllib.request.Request(url, data=json.dumps(body).encode() if body is not None else None,
                                      method=method, headers={**headers, 'Content-Type': 'application/json'})
     try:
-        with OPENER.open(request, timeout=timeout) as response:
+        with NET['opener'].open(request, timeout=timeout) as response:
             raw = response.read(256 * 1024 + 1)
             if len(raw) > 256 * 1024:
                 raise ValueError('Preview response is too large')
@@ -73,6 +92,8 @@ def control(url, body, method, headers, timeout=5):
     except urllib.error.HTTPError as error:
         error.close()
         raise ControlError(error.code) from None
+    except http.client.HTTPException as error:  # A garbled or cut-off answer, such as from a proxy, is a network failure.
+        raise urllib.error.URLError(error) from None
 
 
 def website(config, connection):
@@ -103,7 +124,6 @@ class Core:
             raise ValueError('Invalid hosting credential')
         # Some sandbox proxies replace Authorization with their own login, so Core also reads X-Cloudroom-Token.
         self.headers = {'Authorization': 'Bearer ' + token, 'X-Cloudroom-Token': token, **({'Cookie': '_port_auth=' + gate} if gate else {})}
-        self.opener = OPENER
         # A sandbox gets a new token on every wake, so its tunnels and streams are rebuilt.
         self.key = (self.url, token)
 
@@ -122,9 +142,76 @@ class Core:
         return control(url, body, method, headers, timeout)
 
 
-AWAKE = {'at': 0.0, 'checked': 0.0, 'key': None, 'list': [], 'lock': threading.Lock()}
+AWAKE = {'at': 0.0, 'checked': 0.0, 'key': None, 'list': [], 'blocked': 0, 'lock': threading.Lock()}
 # Every Mac asks the website once a minute; the app touches this file after a wake, so new sandboxes show up at once.
 AWAKE_SECONDS = 60
+# Why the helper last failed to list or reach sandboxes. A VPN, proxy, antivirus, or firewall can block this helper while
+# the app still works, so status.json says why instead of "connected" (#109).
+PROBLEMS, ISSUERS = {}, {}
+# Show only problems that outlast the next minute's check: by then a sandbox that fell asleep has left the list,
+# and a short network drop has passed. Never ask the website more often (db-load-budget).
+PROBLEM_SECONDS = AWAKE_SECONDS + 15
+
+
+def cause(error):
+    """The error underneath: urllib wraps socket and TLS errors."""
+    reason = getattr(error, 'reason', None)
+    return reason if isinstance(reason, BaseException) else error
+
+
+def unsent(error):
+    """True only when the request surely never reached our servers: a refused certificate, no DNS answer, or a refused
+    connection or proxy tunnel. A timeout or reset may have reached them, so it is not one of these."""
+    reason = cause(error)
+    return isinstance(reason, (ssl.SSLCertVerificationError, socket.gaierror, ConnectionRefusedError)) or str(reason).startswith('Tunnel connection failed')
+
+
+def describe(step, error, url):
+    """A failed step, twice: the reason Settings shows under its own title (only what the user can act on, never our
+    servers or internals), and the detail the app saves with the account for debugging (#109, ADR 0201)."""
+    code, reason = getattr(error, 'code', None), cause(error)
+    detail = f"{step} ({'website' if step == 'list' else 'sandbox'}): {type(error).__name__}"
+    detail += f' > {type(reason).__name__}' if reason is not error else ''
+    if code:
+        message = 'Sign out of Cloudroom and sign in again.' if code == 401 else "Cloudroom didn't answer as expected. This is usually temporary."
+        detail += f' HTTP {code}'
+    elif isinstance(reason, ssl.SSLCertVerificationError):
+        message = 'A VPN, proxy, or antivirus on this Mac may be intercepting secure connections.'
+        detail += f' {reason.verify_code} {reason.verify_message}' + (f'; {issuer(url)}' if step == 'list' else '')
+    elif isinstance(reason, socket.gaierror):
+        message = "This Mac can't look up Cloudroom. Check the internet connection or VPN."
+        detail += ' ' + str(reason)[:100]
+    elif unsent(error):
+        message = 'A firewall, VPN, or proxy on this Mac may be blocking Cloudroom.'
+        detail += ' ' + str(reason)[:100]
+    elif isinstance(reason, (OSError, http.client.HTTPException)):  # A drop, timeout, or garbled answer may be our side too.
+        message = "The connection to Cloudroom keeps failing. It may be this Mac's network, or a temporary problem."
+        detail += ' ' + str(reason)[:100]
+    else:
+        message = "Cloudroom didn't answer as expected. This is usually temporary."
+        detail += ' ' + str(reason)[:100]
+    route = 'route unknown'
+    with contextlib.suppress(OSError, ValueError):
+        # urllib follows macOS's system proxy; the app's Node code does not, so a proxy can break only this helper.
+        host = urllib.parse.urlsplit(url).hostname
+        route = 'via system proxy' if NET['proxies'].get('https') and not urllib.request.proxy_bypass(host) else 'direct'
+    return message, f"{detail[:220]}; {route}; Python {sys.version.split()[0]}, {ssl.OPENSSL_VERSION}, {NET['cas']} CAs"
+
+
+def issuer(url):
+    """Who signed the website's certificate as this Mac gets it directly, such as an antivirus's own root. Once per run."""
+    parts = urllib.parse.urlsplit(url)
+    key = (parts.hostname, parts.port or 443)
+    if key not in ISSUERS:
+        ISSUERS[key] = 'issuer unknown'
+        with contextlib.suppress(OSError, ValueError, subprocess.SubprocessError):
+            context = ssl.create_default_context()
+            context.check_hostname, context.verify_mode = False, ssl.CERT_NONE  # Only to read who signed it, never to send data.
+            with socket.create_connection(key, timeout=3) as raw, context.wrap_socket(raw, server_hostname=key[0]) as tls:
+                der = tls.getpeercert(binary_form=True)
+            out = subprocess.run(['openssl', 'x509', '-inform', 'DER', '-noout', '-issuer'], input=der, capture_output=True, timeout=3).stdout
+            ISSUERS[key] = 'direct ' + out.decode(errors='replace').strip()[:90] if out.strip() else 'issuer unknown'
+    return ISSUERS[key]
 
 
 def cores(config):
@@ -133,22 +220,39 @@ def cores(config):
     found = [Core(config)] if connection.get('url') else []
     account, token = (connection.get('account') or {}).get('id'), connection.get('sandboxToken')
     if not account or not token:
+        PROBLEMS.pop('sandboxes', None)
         return found
     woke = Path(config['connectionFile']).parent / 'cloudroom-preview' / 'woke'
     with AWAKE['lock']:
         nudged = False
         with contextlib.suppress(OSError):
             nudged = woke.stat().st_mtime > AWAKE['checked']
-        if AWAKE['key'] != (account, token) or nudged or time.monotonic() - AWAKE['at'] > AWAKE_SECONDS:
+        due = AWAKE['key'] != (account, token) or nudged or time.monotonic() - AWAKE['at'] > AWAKE_SECONDS
+        # While something fails, reread the proxy setting every 30 s and before each new list.
+        if PROBLEMS and (due or time.monotonic() - NET['at'] >= NETWORK_SECONDS):
+            network()
+        if due:
             AWAKE.update(at=time.monotonic(), checked=time.time(), key=(account, token))
             try:
                 uuid.UUID(account)
                 credential = base64.b64encode((account + ':' + token).encode()).decode()
                 listed = control(website(config, connection) + '/api/desktop/sandboxes', {'action': 'awake'}, 'POST', {'Authorization': 'Basic ' + credential})
                 AWAKE['list'] = [(entry['origin'], entry['token'], entry.get('thread')) for entry in listed['sandboxes']]
-            except (OSError, ValueError, KeyError, TypeError):
-                pass  # Keep the last list; sandboxes are asked again shortly.
+                PROBLEMS.pop('sandboxes', None)
+                AWAKE['blocked'] = 0
+            except (OSError, ValueError, KeyError, TypeError) as error:
+                # Keep the last list. A request that never reached our servers is retried in 10-20 s, at random so Macs
+                # never line up after an outage; that costs our servers nothing (db-load-budget). Others wait a minute.
+                AWAKE['blocked'] = AWAKE['blocked'] + 1 if unsent(error) else 0
+                if AWAKE['blocked']:
+                    AWAKE['at'] = time.monotonic() - AWAKE_SECONDS + random.uniform(10, 20)
+                # Under the lock, so a status written meanwhile never misses it. A certificate failure first probes the
+                # website, once per run.
+                PROBLEMS['sandboxes'] = describe('list', error, connection.get('websiteUrl') or 'https://www.cloudroom.dev')
         awake = list(AWAKE['list'])
+    if nudged:
+        with NUDGE:
+            NUDGE.notify_all()
     if config.get('ownThreads'):
         awake = own_threads(config, awake)
     for origin, secret, thread in awake:
@@ -341,7 +445,7 @@ class Relay:
         remote = socket.create_connection((url.hostname, url.port or (443 if url.scheme == 'https' else 80)), timeout=10)
         if url.scheme == 'https':
             remote = ssl.create_default_context().wrap_socket(remote, server_hostname=url.hostname)
-        headers = ''.join(f'{key}: {value}\r\n' for key, value in self.core.headers.items())
+        headers = ''.join(f'{key}: {value}\r\n' for key, value in {'User-Agent': USER_AGENT, **self.core.headers}.items())
         remote.sendall(f'GET /v1/previews/{self.port}/tunnel?device={self.device} HTTP/1.1\r\nHost: {url.netloc}\r\n'
                        f'Connection: Upgrade\r\nUpgrade: {protocol}\r\n{headers}\r\n'.encode())
         head = b''
@@ -661,7 +765,7 @@ class MacJobs:
             try:
                 request = urllib.request.Request(core.url + '/v1/mac/jobs?device=' + device,
                                                  headers={**core.headers, 'Accept': 'text/event-stream'})
-                with core.opener.open(request, timeout=60) as stream:
+                with NET['opener'].open(request, timeout=60) as stream:
                     delay, event = 2, None
                     for raw in stream:
                         line = raw.decode().rstrip('\r\n')
@@ -673,14 +777,15 @@ class MacJobs:
                             self.cancel(json.loads(line[5:])['id'])
                         elif line.startswith(':') and (not self.enabled() or core.key not in self.wanted):
                             break
-            except (OSError, ValueError, KeyError, TypeError) as error:
+            except (OSError, ValueError, KeyError, TypeError, http.client.HTTPException) as error:
                 delay = min(delay * 2, 30)
                 # A new sandbox refuses this Mac until it pairs; pair here instead of backing off until the preview loop does.
                 if getattr(error, 'code', None) == 403:
                     with contextlib.suppress(OSError, ValueError):
                         core.request('/device', {'device': device, 'public_key': identity(self.folder)})
                         delay = 1
-            time.sleep(delay)
+            with NUDGE:  # Check now wakes this wait.
+                NUDGE.wait(delay)
 
     def execute(self, core, device, job):
         def post(body, timeout=MAC_POST_SECONDS):
@@ -778,7 +883,11 @@ def run(folder):
     ports_file = folder / 'ports.json'
     ports = private_json(ports_file) if ports_file.exists() else {}
     prepare_due, refresh, authenticated, delay = 0, True, 0, 2
-    denied, credential = None, None
+    denied, credential, troubled, pairing = None, None, None, None
+    # A restart (app launch, update, or a setting change) shows a problem it had already shown at once, if it is still there.
+    with contextlib.suppress(OSError, ValueError):
+        if private_json(folder / 'status.json').get('detail'):
+            troubled = time.monotonic() - PROBLEM_SECONDS
     def stop(*_):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, stop)
@@ -805,19 +914,32 @@ def run(folder):
                                 denied = error
                     if denied:
                         raise denied
-                    desired = {}
+                    desired, reached, failure = {}, 0, None
                     # Sandboxes first, so a VM that turns this Mac away can't block their Mac access.
                     for core in sorted(listed, key=lambda core: not core.sandbox):
                         try:
                             metadata = core.request('/device', {'device': config['device'], 'public_key': identity(folder)})
+                            reached += core.sandbox
                             for entry in core.request('')['previews']:
                                 port = entry['port']
                                 if type(port) is not int or not 1024 <= port <= 65535 or not isinstance(entry['generation'], str):
                                     raise ValueError('Invalid preview registration')
                                 desired[(core.key, port)] = (core, entry['generation'], metadata)
-                        except (OSError, ValueError):
+                        except (OSError, ValueError) as error:
                             if not core.sandbox:
                                 raise  # A sandbox may fall asleep at any moment; the others keep working.
+                            # An HTTP answer means this Mac reaches sandboxes and the sandbox side declined: paired with
+                            # another Mac, still waking up, or about to leave the list. Only a network failure counts.
+                            if getattr(error, 'code', None):
+                                reached += 1
+                            elif isinstance(cause(error), (OSError, http.client.HTTPException)):
+                                failure = (error, core.url)
+                    kind = type(cause(failure[0])) if failure and not reached else None
+                    if kind is None:
+                        PROBLEMS.pop('pairing', None)
+                    elif kind is not pairing:  # Describe again only when the cause changes.
+                        PROBLEMS['pairing'] = describe('pair', *failure)
+                    pairing = kind
                     authenticated = time.monotonic()
                     failed = {key for key, tunnel in tunnels.items() if tunnel.process.poll() is not None}
                     refresh = refresh or bool(failed)
@@ -862,10 +984,20 @@ def run(folder):
                         return ready
                     with concurrent.futures.ThreadPoolExecutor() as pool:
                         ready = sum(pool.map(report, tunnels.values()))
-                    save(folder / 'status.json', {'state': 'connected', 'count': len(tunnels), 'ready': ready, 'checkedAt': int(time.time() * 1000)})
+                    # No awake sandbox reached: say why. A working VM keeps its previews; its own failures take the error path.
+                    problem = None if vm or reached else PROBLEMS.get('sandboxes') or PROBLEMS.get('pairing')
+                    troubled = (troubled or time.monotonic()) if problem else None
+                    # Can't reach Cloudroom at all, twice in a row: no sandbox sleep explains that, so show it now.
+                    fast = not reached and AWAKE['blocked'] >= 2
+                    if problem and (fast or time.monotonic() - troubled >= PROBLEM_SECONDS):
+                        save(folder / 'status.json', {'state': 'offline', 'message': problem[0], 'detail': problem[1], 'checkedAt': int(time.time() * 1000)})
+                    else:
+                        save(folder / 'status.json', {'state': 'connected', 'count': len(tunnels), 'ready': ready, 'checkedAt': int(time.time() * 1000)})
                     delay = 2
                 except (OSError, ValueError, KeyError, TypeError, subprocess.SubprocessError) as error:
                     refresh = True
+                    if time.monotonic() - NET['at'] >= NETWORK_SECONDS:
+                        network()  # An unreachable VM may sit behind a proxy that just changed.
                     transient = isinstance(error, (OSError, ControlError)) and not (isinstance(error, ControlError) and error.code not in (429, 500, 502, 503, 504))
                     if not transient or time.monotonic() - authenticated >= 15:
                         for tunnel in tunnels.values():

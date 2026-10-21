@@ -3,6 +3,8 @@
 //! A child gets a sandbox of its own by default (ADR 0229). The app starts it, so Core records the request and
 //! waits briefly for the app's answer; without one, the child starts in this sandbox instead. Once started, the
 //! website carries its `tell`, `stop`, `archive` and turn reports, even while the app is closed (relay.rs).
+//! `thread fork` asks the app the same way to fork this thread into a new Cloud thread; without an answer there is no
+//! fork. Only the user forks to their Mac, from the app.
 //! `spawn --top-level` asks the website to start a top-level thread instead, with no link back (ADR 0267).
 use super::{Manager, relay};
 use crate::preview::Peer;
@@ -27,6 +29,7 @@ room-cli thread update --self --reasoning-level LEVEL
 room-cli thread archive --self
 room-cli thread stop --self
 room-cli thread spawn --provider codex|claude-code|pi|opencode|hermes|devin|fx|openclaw [--model MODEL] [--reasoning-level LEVEL] [--service-tier default|fast] [--title TITLE] [--shared-sandbox|--top-level] --prompt TEXT|--prompt-file PATH
+room-cli thread fork [--provider codex|claude-code|pi|opencode|hermes|devin|fx|openclaw] [--model MODEL] [--reasoning-level LEVEL] [--title TITLE] --prompt TEXT|--prompt-file PATH
 room-cli thread list [--include-archived]
 room-cli thread output CHILD_ID [--all]
 room-cli thread tell CHILD_ID TEXT
@@ -35,6 +38,7 @@ room-cli thread archive CHILD_ID";
 const SPAWN_NOTE: &str = "Started in this sandbox and folder. Keep working: Cloudroom sends you a message each time it finishes a turn.";
 const OWN_NOTE: &str = "Started in its own sandbox with a copy of your code (commits and uncommitted changes), on its own branch. It doesn't see your later edits; share work through Git. Use this ID with tell, stop and archive. Keep working: Cloudroom sends you a message each time it finishes a turn.";
 const FALLBACK_NOTE: &str = " The user's Cloudroom app didn't start it in its own sandbox (it's probably closed), so it runs here.";
+const FORK_NOTE: &str = "Forked this thread at its last finished turn: a new thread with this conversation and your code (commits and uncommitted changes), on its own branch where the project uses Git. It runs on its own and doesn't report back to you; it doesn't see your later edits.";
 const TOP_NOTE: &str = "Started as a top-level thread in its own sandbox, from the project's GitHub repo (push your work first) and .env files. It is not your child: it doesn't report back, and you can't tell, stop or read it. It shows in the user's sidebar within a minute.";
 /// How long `spawn --top-level` keeps retrying a start the website could not finish (say, a slow wake).
 const LAUNCH_RETRY: Duration = Duration::from_secs(240);
@@ -42,6 +46,9 @@ const LAUNCH_RETRY: Duration = Duration::from_secs(240);
 /// share this sandbox right away, so a closed app costs one wait, not one per child.
 const APP_WAIT: Duration = Duration::from_secs(60);
 const APP_MISSED_FOR: Duration = Duration::from_secs(300);
+/// How long a fork waits for the app. It stays under Claude Code's 2-minute command limit, so the agent always
+/// sees the outcome instead of a killed command it might retry. The app ignores older requests (AGENT_FORK_WAIT).
+const FORK_WAIT: Duration = Duration::from_secs(90);
 /// How long a child request's outcome is remembered, so a retried spawn or a repeated app answer gets the same one.
 const OUTCOME_KEPT: Duration = Duration::from_secs(3600);
 /// Each child request's outcome, by parent session and request ID. It is decided once, under this lock, so a
@@ -83,6 +90,18 @@ pub struct SpawnBody {
     service_tier: Option<String>,
 }
 
+/// `thread fork`: a Cloud fork of the calling thread, made by the app.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkBody {
+    request_id: Option<String>,
+    provider: Option<String>,
+    model: Option<String>,
+    reasoning: Option<String>,
+    title: Option<String>,
+    prompt: String,
+}
+
 /// The app's answer to a child request: the child thread it started, or why it could not.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -118,6 +137,7 @@ pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
         .route("/reasoning", post(set_reasoning))
         .route("/archive", post(archive))
         .route("/children", get(list).post(spawn))
+        .route("/fork", post(fork))
         .route("/children/{id}", get(output))
         .route("/children/{id}/messages", post(tell))
         .route("/children/{id}/stop", post(stop_child))
@@ -249,12 +269,13 @@ async fn spawn(
 ) -> Result<Json<Value>, Failure> {
     let parent = caller(&m, peer, "thread spawn")?;
     let bad = |message: &str| fail(StatusCode::CONFLICT, message);
-    if input.prompt.trim().is_empty() || input.prompt.len() > 32768 {
-        return Err(bad("Use a prompt of 1-32768 bytes"));
-    }
-    if input.title.as_deref().is_some_and(|t| !valid(t.trim())) {
-        return Err(bad("Use a title of 1-200 characters"));
-    }
+    let harness = check_start(
+        &input.prompt,
+        input.title.as_deref(),
+        input.model.as_deref(),
+        input.reasoning.as_deref(),
+        input.provider.as_deref(),
+    )?;
     if input
         .service_tier
         .as_deref()
@@ -262,64 +283,8 @@ async fn spawn(
     {
         return Err(bad("Use --service-tier default or fast"));
     }
-    if input
-        .model
-        .as_ref()
-        .is_some_and(|m| m.is_empty() || m.len() > 256 || m.chars().any(char::is_control))
-    {
-        return Err(bad("invalid model"));
-    }
-    if input
-        .reasoning
-        .as_ref()
-        .is_some_and(|r| r.is_empty() || r.len() > 64 || !r.bytes().all(|b| b.is_ascii_lowercase()))
-    {
-        return Err(bad("invalid reasoning level"));
-    }
-    let harness = input
-        .provider
-        .as_deref()
-        .map(|p| {
-            serde_json::from_value(json!(p)).map_err(|_| {
-                bad("Use --provider codex, claude-code, pi, opencode, hermes, devin, fx or openclaw")
-            })
-        })
-        .transpose()?;
-    // Only a Pi parent passes its own model on; Cloud's default Pi model may not work with the user's logins.
-    let pi_parent = m
-        .local
-        .lock()
-        .unwrap()
-        .sessions
-        .get(&parent)
-        .map(|p| p.harness)
-        == Some(crate::runtime::Kind::Pi);
-    if harness == Some(crate::runtime::Kind::Pi)
-        && !pi_parent
-        && !input
-            .model
-            .as_deref()
-            .and_then(|m| m.split_once('/'))
-            .is_some_and(|(p, n)| !p.is_empty() && !n.is_empty())
-    {
-        return Err(bad(
-            "Select a Pi provider and model: add --model provider/model, for example anthropic/claude-haiku-5-5",
-        ));
-    }
-    let key = match input.request_id.clone() {
-        Some(key) => key,
-        None => random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?,
-    };
-    if key.is_empty()
-        || key.len() > 64
-        || !key
-            .bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
-    {
-        return Err(bad(
-            "request_id must be 1-64 ASCII letters, digits, underscores or hyphens",
-        ));
-    }
+    pi_model(&m, &parent, harness, input.model.as_deref())?;
+    let key = request_key(input.request_id.clone())?;
     if input.top_level {
         if input.shared {
             return Err(bad(
@@ -417,47 +382,7 @@ async fn own_sandbox_child(
     key: &str,
     input: &SpawnBody,
 ) -> Result<Option<String>, Failure> {
-    let id = format!("own_{key}");
-    let slot = format!("{parent}/{id}");
-    let (reply, answer) = oneshot::channel();
-    {
-        let mut children = CHILDREN.lock().unwrap();
-        children.retain(|_, outcome| match outcome {
-            Outcome::Started(_, at) | Outcome::Here(at) => at.elapsed() < OUTCOME_KEPT,
-            Outcome::Waiting(_) => true,
-        });
-        match children.get(&slot) {
-            Some(Outcome::Started(thread, _)) => return Ok(Some(thread.clone())),
-            Some(Outcome::Here(_)) => return Ok(None),
-            Some(Outcome::Waiting(_)) => {
-                return Err(fail(
-                    StatusCode::CONFLICT,
-                    "A child with this request_id is already starting",
-                ));
-            }
-            None => {}
-        }
-        if APP_MISSED
-            .lock()
-            .unwrap()
-            .is_some_and(|at| at.elapsed() < APP_MISSED_FOR)
-        {
-            return Ok(None);
-        }
-        children.insert(slot.clone(), Outcome::Waiting(reply));
-    }
-    // If the agent stops waiting before the app answers, the child runs nowhere and a late start is cancelled.
-    struct Pending(String);
-    impl Drop for Pending {
-        fn drop(&mut self) {
-            let mut children = CHILDREN.lock().unwrap();
-            if let Some(outcome @ Outcome::Waiting(_)) = children.get_mut(&self.0) {
-                *outcome = Outcome::Here(Instant::now());
-            }
-        }
-    }
-    let _pending = Pending(slot.clone());
-    let mut data = json!({"id":id,"prompt":input.prompt});
+    let mut data = json!({"id":format!("own_{key}"),"prompt":input.prompt});
     for (name, value) in [
         ("provider", &input.provider),
         ("model", &input.model),
@@ -469,32 +394,220 @@ async fn own_sandbox_child(
             data[name] = json!(value);
         }
     }
-    let _ = record(m, parent, "child_request", data)?;
-    let answer = tokio::time::timeout(APP_WAIT, answer).await;
-    match answer {
-        Ok(Ok(Ok(thread))) => {
-            *APP_MISSED.lock().unwrap() = None;
-            Ok(Some(thread))
-        }
-        Ok(Ok(Err(error))) => Err(fail(
+    match ask_app(m, parent, "child_request", data, APP_WAIT).await? {
+        Asked::Started(thread) => Ok(Some(thread)),
+        Asked::Refused(error) => Err(fail(
             StatusCode::CONFLICT,
             &format!(
                 "The child could not start in its own sandbox: {error}. Retry, or add --shared-sandbox to start it here."
             ),
         )),
+        Asked::Missed => Ok(None),
+    }
+}
+
+/// Only a Pi parent passes its own model on; Cloud's default Pi model may not work with the user's logins.
+fn pi_model(
+    m: &Manager,
+    parent: &str,
+    harness: Option<crate::runtime::Kind>,
+    model: Option<&str>,
+) -> Result<(), Failure> {
+    let pi_parent = m
+        .local
+        .lock()
+        .unwrap()
+        .sessions
+        .get(parent)
+        .map(|p| p.harness)
+        == Some(crate::runtime::Kind::Pi);
+    if harness == Some(crate::runtime::Kind::Pi)
+        && !pi_parent
+        && !model
+            .and_then(|m| m.split_once('/'))
+            .is_some_and(|(p, n)| !p.is_empty() && !n.is_empty())
+    {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "Select a Pi provider and model: add --model provider/model, for example anthropic/claude-haiku-5-5",
+        ));
+    }
+    Ok(())
+}
+
+/// A spawn's or fork's checks; for a provider, its harness.
+fn check_start(
+    prompt: &str,
+    title: Option<&str>,
+    model: Option<&str>,
+    reasoning: Option<&str>,
+    provider: Option<&str>,
+) -> Result<Option<crate::runtime::Kind>, Failure> {
+    let bad = |message: &str| fail(StatusCode::CONFLICT, message);
+    if prompt.trim().is_empty() || prompt.len() > super::MAX_PROMPT {
+        return Err(bad("Use a prompt of 1-262144 bytes"));
+    }
+    if title.is_some_and(|t| !valid(t.trim())) {
+        return Err(bad("Use a title of 1-200 characters"));
+    }
+    if model.is_some_and(|m| m.is_empty() || m.len() > 256 || m.chars().any(char::is_control)) {
+        return Err(bad("invalid model"));
+    }
+    if reasoning
+        .is_some_and(|r| r.is_empty() || r.len() > 64 || !r.bytes().all(|b| b.is_ascii_lowercase()))
+    {
+        return Err(bad("invalid reasoning level"));
+    }
+    provider
+        .map(|p| {
+            serde_json::from_value(json!(p)).map_err(|_| {
+                bad("Use --provider codex, claude-code, pi, opencode, hermes, devin, fx or openclaw")
+            })
+        })
+        .transpose()
+}
+
+fn request_key(key: Option<String>) -> Result<String, Failure> {
+    let key = match key {
+        Some(key) => key,
+        None => random_key().map_err(|e| fail(StatusCode::SERVICE_UNAVAILABLE, &e.to_string()))?,
+    };
+    if key.is_empty()
+        || key.len() > 64
+        || !key
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_-".contains(&b))
+    {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "request_id must be 1-64 ASCII letters, digits, underscores or hyphens",
+        ));
+    }
+    Ok(key)
+}
+
+enum Asked {
+    Started(String),
+    Refused(String),
+    /// No answer: the app is closed or too old.
+    Missed,
+}
+
+/// Records a request for the app (`data.id` names it) and waits for its answer: a child to start in a sandbox of
+/// its own, or a fork. A late start after a miss is cancelled.
+async fn ask_app(
+    m: &Manager,
+    parent: &str,
+    kind: &str,
+    data: Value,
+    wait: Duration,
+) -> Result<Asked, Failure> {
+    let slot = format!("{parent}/{}", data["id"].as_str().unwrap_or_default());
+    let (reply, answer) = oneshot::channel();
+    {
+        let mut children = CHILDREN.lock().unwrap();
+        children.retain(|_, outcome| match outcome {
+            Outcome::Started(_, at) | Outcome::Here(at) => at.elapsed() < OUTCOME_KEPT,
+            Outcome::Waiting(_) => true,
+        });
+        match children.get(&slot) {
+            Some(Outcome::Started(thread, _)) => return Ok(Asked::Started(thread.clone())),
+            Some(Outcome::Here(_)) => return Ok(Asked::Missed),
+            Some(Outcome::Waiting(_)) => {
+                return Err(fail(
+                    StatusCode::CONFLICT,
+                    "A request with this request_id is already starting",
+                ));
+            }
+            None => {}
+        }
+        // After a recent miss a spawn shares this sandbox right away; a fork has no such fallback, so it asks.
+        if kind == "child_request"
+            && APP_MISSED
+                .lock()
+                .unwrap()
+                .is_some_and(|at| at.elapsed() < APP_MISSED_FOR)
+        {
+            return Ok(Asked::Missed);
+        }
+        children.insert(slot.clone(), Outcome::Waiting(reply));
+    }
+    // If the agent stops waiting before the app answers, nothing starts and a late start is cancelled.
+    struct Pending(String);
+    impl Drop for Pending {
+        fn drop(&mut self) {
+            let mut children = CHILDREN.lock().unwrap();
+            if let Some(outcome @ Outcome::Waiting(_)) = children.get_mut(&self.0) {
+                *outcome = Outcome::Here(Instant::now());
+            }
+        }
+    }
+    let _pending = Pending(slot.clone());
+    let _ = record(m, parent, kind, data)?;
+    let answer = tokio::time::timeout(wait, answer).await;
+    match answer {
+        Ok(Ok(Ok(thread))) => {
+            *APP_MISSED.lock().unwrap() = None;
+            Ok(Asked::Started(thread))
+        }
+        Ok(Ok(Err(error))) => Ok(Asked::Refused(error)),
         // No answer in time: decide under the lock, since the app may be answering right now.
         _ => {
             let mut children = CHILDREN.lock().unwrap();
             match children.get_mut(&slot) {
-                Some(Outcome::Started(thread, _)) => Ok(Some(thread.clone())),
+                Some(Outcome::Started(thread, _)) => Ok(Asked::Started(thread.clone())),
                 Some(outcome) => {
                     *outcome = Outcome::Here(Instant::now());
-                    *APP_MISSED.lock().unwrap() = Some(Instant::now());
-                    Ok(None)
+                    // Only a missed spawn moves later spawns into this sandbox; an app may not know forks yet.
+                    if kind == "child_request" {
+                        *APP_MISSED.lock().unwrap() = Some(Instant::now());
+                    }
+                    Ok(Asked::Missed)
                 }
-                None => Ok(None),
+                None => Ok(Asked::Missed),
             }
         }
+    }
+}
+
+/// `thread fork`: the app forks the calling thread at its last finished turn into a new Cloud thread, optionally into
+/// another harness. Only the app can make it, so without an answer there is no fork.
+async fn fork(
+    State(m): State<Arc<Manager>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Json(input): Json<ForkBody>,
+) -> Result<Json<Value>, Failure> {
+    let parent = caller(&m, peer, "thread fork")?;
+    let harness = check_start(
+        &input.prompt,
+        input.title.as_deref(),
+        input.model.as_deref(),
+        input.reasoning.as_deref(),
+        input.provider.as_deref(),
+    )?;
+    pi_model(&m, &parent, harness, input.model.as_deref())?;
+    let key = request_key(input.request_id)?;
+    let mut data = json!({"id":format!("fork_{key}"),"prompt":input.prompt});
+    for (name, value) in [
+        ("provider", input.provider),
+        ("model", input.model),
+        ("reasoning", input.reasoning),
+        ("title", input.title.map(|t| t.trim().to_owned())),
+    ] {
+        if let Some(value) = value {
+            data[name] = json!(value);
+        }
+    }
+    match ask_app(&m, &parent, "fork_request", data, FORK_WAIT).await? {
+        Asked::Started(thread) => Ok(Json(json!({"id":thread,"note":FORK_NOTE}))),
+        Asked::Refused(error) => Err(fail(
+            StatusCode::CONFLICT,
+            &format!("The fork could not start: {error}"),
+        )),
+        Asked::Missed => Err(fail(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "The user's Cloudroom app didn't answer, so no fork was made. Forks need the app open on their Mac; try again later.",
+        )),
     }
 }
 
@@ -532,7 +645,7 @@ async fn answer_child(
             } else {
                 Err(fail(
                     StatusCode::CONFLICT,
-                    "This child request already ended: the child runs in the parent's sandbox",
+                    "This request already ended another way (Core gave up waiting, or another answer came first)",
                 ))
             }
         }
@@ -596,8 +709,11 @@ async fn tell(
     Json(input): Json<Tell>,
 ) -> Result<Json<Value>, Failure> {
     let parent = caller(&m, peer, "thread tell")?;
-    if input.text.trim().is_empty() || input.text.len() > 32768 {
-        return Err(fail(StatusCode::CONFLICT, "Use a message of 1-32768 bytes"));
+    if input.text.trim().is_empty() || input.text.len() > super::MAX_PROMPT {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "Use a message of 1-262144 bytes",
+        ));
     }
     if relay::thread_id(&id) {
         return relay::command(&m, &parent, &id, "tell", Some(&input.text)).await;
@@ -750,13 +866,25 @@ const SPAWN_VALUES: [&str; 12] = [
     "--base-branch",
 ];
 
-/// The first word `room-cli thread spawn` would otherwise ignore, so nothing the agent asked for is silently dropped.
-fn unknown_spawn_word<'a>(words: &[&'a str]) -> Option<&'a str> {
+/// Flags `room-cli thread fork` takes with a value.
+const FORK_VALUES: [&str; 8] = [
+    "--machine",
+    "--provider",
+    "--model",
+    "--reasoning-level",
+    "--title",
+    "--request-id",
+    "--prompt",
+    "--prompt-file",
+];
+
+/// The first word a command would otherwise ignore, so nothing the agent asked for is silently dropped.
+fn unknown_word<'a>(words: &[&'a str], values: &[&str], switches: &[&str]) -> Option<&'a str> {
     let mut rest = words.iter();
     while let Some(word) = rest.next() {
-        if SPAWN_VALUES.contains(word) {
+        if values.contains(word) {
             rest.next();
-        } else if !matches!(*word, "--shared-sandbox" | "--parent-self" | "--top-level") {
+        } else if !switches.contains(word) {
             return Some(word);
         }
     }
@@ -764,7 +892,11 @@ fn unknown_spawn_word<'a>(words: &[&'a str]) -> Option<&'a str> {
 }
 
 async fn spawn_cli(words: &[&str]) -> io::Result<i32> {
-    if let Some(word) = unknown_spawn_word(words) {
+    if let Some(word) = unknown_word(
+        words,
+        &SPAWN_VALUES,
+        &["--shared-sandbox", "--parent-self", "--top-level"],
+    ) {
         eprintln!(
             "Unknown option {word}. Cloud threads take only the options in `room-cli thread --help`."
         );
@@ -827,6 +959,53 @@ async fn spawn_cli(words: &[&str]) -> io::Result<i32> {
     Ok(0)
 }
 
+async fn fork_cli(words: &[&str]) -> io::Result<i32> {
+    // Only this thread can be forked from here, so a thread ID other than `--self` is refused rather than ignored,
+    // like any option the command doesn't take.
+    if let Some(word) = unknown_word(words, &FORK_VALUES, &["--self"]) {
+        if word.starts_with('-') {
+            eprintln!(
+                "Unknown option {word}. Cloud threads take only the options in `room-cli thread --help`."
+            );
+        } else {
+            eprintln!(
+                "A Cloud thread can fork only itself; {word} is not needed. Omit it (or use --self)."
+            );
+        }
+        return Ok(2);
+    }
+    // Agents fork only to Cloud (David, 2026-10-19); `--machine cloud` is a harmless Local habit.
+    if flag(words, "--machine").is_some_and(|m| m != "cloud") {
+        eprintln!(
+            "Cloud agents fork only to Cloud. Omit --machine; only the user can fork to their Mac, from the Cloudroom app."
+        );
+        return Ok(2);
+    }
+    let prompt = match (flag(words, "--prompt"), flag(words, "--prompt-file")) {
+        (Some(text), None) => text.to_owned(),
+        (None, Some(path)) => std::fs::read_to_string(path)?,
+        _ => {
+            println!("{USAGE}");
+            return Ok(2);
+        }
+    };
+    let mut body = json!({"prompt":prompt});
+    for (name, key) in [
+        ("--provider", "provider"),
+        ("--model", "model"),
+        ("--reasoning-level", "reasoning"),
+        ("--title", "title"),
+        ("--request-id", "request_id"),
+    ] {
+        if let Some(value) = flag(words, name) {
+            body[key] = json!(value);
+        }
+    }
+    let answer = crate::mac::request(crate::mac::SOCKET, "POST", "/fork", Some(body)).await?;
+    println!("{answer}");
+    Ok(0)
+}
+
 /// The same `room-cli thread ... --self` forms local threads use. `--json` is accepted and
 /// ignored because the answer is always JSON.
 pub async fn cli(args: &[String]) -> io::Result<i32> {
@@ -842,6 +1021,7 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
             return Ok(0);
         }
         ["spawn", rest @ ..] => return spawn_cli(rest).await,
+        ["fork", rest @ ..] => return fork_cli(rest).await,
         ["list", rest @ ..] => {
             let path = if rest.contains(&"--include-archived") {
                 "/children?include_archived=true"

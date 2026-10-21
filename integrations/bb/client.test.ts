@@ -332,7 +332,7 @@ test("rejects invalid requests before network access", async (t) => {
   await assert.rejects(service.client.start("bad/id"), /request_id/);
   assert.throws(() => service.client.prompt("s1", "p1", " "), /Prompt/);
   assert.throws(
-    () => service.client.prompt("s1", "p1", "🟠".repeat(9000)),
+    () => service.client.prompt("s1", "p1", "🟠".repeat(70000)),
     /bytes/,
   );
   assert.throws(

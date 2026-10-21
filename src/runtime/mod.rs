@@ -1107,3 +1107,33 @@ pub async fn wait_for_exit(pid: u32) -> io::Result<()> {
     .await
     .map_err(|_| io::Error::other("previous process has not exited; refusing replacement"))?
 }
+
+/// Every plan-limit error says this, so a parent's notice can tell it from a crash.
+pub(crate) const PLAN_LIMIT: &str = "plan limit (not Cloudroom's).";
+/// Core resumes a limited thread at the reset only if it is this soon (provider-retry's rule).
+pub(crate) const RESUME_WITHIN_MS: u64 = 6 * 60 * 60 * 1000;
+
+/// A provider's plan limit stopped the turn; `resets` is when, in ms, if the provider said.
+fn plan_limited(harness: &str, resets: Option<u64>) -> Event {
+    Event::Record {
+        kind: "usage_limited",
+        data: serde_json::json!({"harness":harness,"resets_at_ms":resets}),
+        native: None,
+    }
+}
+
+/// The error a plan-limited turn shows, then the provider's own words.
+fn plan_limit_error(provider: &str, resets: Option<u64>, said: &str) -> String {
+    let when = match resets {
+        Some(at) if at.saturating_sub(crate::observability::now_ms()) <= RESUME_WITHIN_MS => {
+            let minutes = at / 60_000 % 1440;
+            format!(
+                "Resumes at {:02}:{:02} UTC, or as soon as you switch accounts.",
+                minutes / 60,
+                minutes % 60
+            )
+        }
+        _ => "Switch accounts to keep working.".into(),
+    };
+    format!("{provider}'s {PLAN_LIMIT} {when} {provider} said: {said}")
+}

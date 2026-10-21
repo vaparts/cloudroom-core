@@ -17,11 +17,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{io, sync::Arc};
 
-const USAGE: &str = "room-cli automation create --name NAME --prompt TEXT|--prompt-file PATH (--cron 'MIN HOUR DAY MONTH WEEKDAY' [--timezone ZONE] | --at ISO_TIME | --in 30m | --webhook) [--new-thread|--same-thread] [--script TEXT|--script-file PATH]
+const USAGE: &str = "room-cli automation create --name NAME --prompt TEXT|--prompt-file PATH (--cron 'MIN HOUR DAY MONTH WEEKDAY' [--timezone ZONE] | --at ISO_TIME | --in 30m | --webhook) [--new-thread|--same-thread] [--script TEXT|--script-file PATH] [--provider P] [--model M] [--reasoning LEVEL]
 room-cli automation list
-room-cli automation update ID [--name NAME] [--prompt TEXT] [--cron EXPR [--timezone ZONE] | --at ISO_TIME | --in 30m] [--script TEXT|--script-file PATH]
+room-cli automation update ID [--name NAME] [--prompt TEXT] [--cron EXPR [--timezone ZONE] | --at ISO_TIME | --in 30m] [--script TEXT|--script-file PATH] [--provider P] [--model M] [--reasoning LEVEL]
 room-cli automation pause|resume|run|delete|hook ID
-A loop runs on a schedule even while the user's Mac is off (`room-cli loop` is the same command): every minute with a script, else at most every 15 minutes. A --webhook loop runs when its secret URL gets a POST instead: create prints the URL once, `hook ID` replaces it, and each run gets the requests that arrived as data. Each --cron run starts a fresh Cloud thread in its own sandbox, from this thread's project and agent; --same-thread re-prompts this thread instead. A one-time --at/--in run re-prompts this thread; --new-thread gives it a fresh one. A fresh-thread automation saves this thread's settings, so it keeps running after this thread is archived. A script runs first (60 s), in the automation's own sandbox with fresh threads, else in this one: no output skips the run, and its output is added to the prompt. Cloudroom fills in the next run within a minute; check `list` for it or an error.";
+A loop runs on a schedule even while the user's Mac is off (`room-cli loop` is the same command): every minute with a script, else at most every 15 minutes. A --webhook loop runs when its secret URL gets a POST instead: create prints the URL once, `hook ID` replaces it, and each run gets the requests that arrived as data. Each --cron run starts a fresh Cloud thread in its own sandbox, from this thread's project and agent; --same-thread re-prompts this thread instead. A one-time --at/--in run re-prompts this thread; --new-thread gives it a fresh one. A fresh-thread automation saves this thread's settings, so it keeps running after this thread is archived. Its runs use this thread's agent unless --provider, --model, or --reasoning picks another (fresh-thread loops only); `list` shows each loop's agent, and `update` changes it. A script runs first (60 s), in the automation's own sandbox with fresh threads, else in this one: no output skips the run, and its output is added to the prompt. Cloudroom fills in the next run within a minute; check `list` for it or an error.";
 const MAX_PROMPT: usize = 32_000;
 
 #[derive(Deserialize, Serialize)]
@@ -48,6 +48,12 @@ pub struct Body {
     script: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     webhook: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    harness: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    model: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning: Option<String>,
 }
 
 /// Served on the agent-only socket that `room-cli mac` also uses.
@@ -122,6 +128,21 @@ fn check(input: &Body) -> Result<(), Failure> {
         .is_some_and(|c| c.split_whitespace().count() != 5)
     {
         return bad("Use a 5-field cron: minute hour day month weekday");
+    }
+    // As `thread spawn` checks them; the website checks the harness.
+    if input
+        .model
+        .as_ref()
+        .is_some_and(|m| m.is_empty() || m.len() > 256 || m.chars().any(char::is_control))
+    {
+        return bad("invalid model");
+    }
+    if input
+        .reasoning
+        .as_ref()
+        .is_some_and(|r| r.is_empty() || r.len() > 64 || !r.bytes().all(|b| b.is_ascii_lowercase()))
+    {
+        return bad("invalid reasoning level");
     }
     if input.webhook.is_some() && input.script.is_some() {
         return bad("A webhook loop has no script yet");
@@ -225,6 +246,11 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
                 ("--cron", "cron"),
                 ("--timezone", "timezone"),
                 ("--at", "at"),
+                ("--provider", "harness"),
+                ("--model", "model"),
+                // `thread spawn` calls it --reasoning-level.
+                ("--reasoning-level", "reasoning"),
+                ("--reasoning", "reasoning"),
             ] {
                 if let Some(value) = flag(&words, name) {
                     body[key] = json!(value);

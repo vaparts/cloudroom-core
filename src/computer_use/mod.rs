@@ -81,7 +81,14 @@ fn bus() -> String {
 }
 
 fn desktop_env(command: &mut Command) -> &mut Command {
+    // Mesa's software GPU starts a thread per reported CPU, so one animated page could fill the whole box.
+    // An agent's own value wins, for a heavy 3D render.
+    if std::env::var_os("LP_NUM_THREADS").is_none() {
+        command.env("LP_NUM_THREADS", "2");
+    }
     command
+        // The screen, its helpers and launched apps never keep the sandbox awake (runtime/linux.rs `desktop`).
+        .env(crate::runtime::linux::DESKTOP_MARKER, "1")
         .env("DISPLAY", DISPLAY)
         .env("DBUS_SESSION_BUS_ADDRESS", bus())
         .env("CUA_DRIVER_RS_TELEMETRY_ENABLED", "false")

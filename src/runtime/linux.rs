@@ -11,6 +11,8 @@ use tokio::{process::Command, sync::watch};
 
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const MARKER: &[u8] = b"CLOUDROOM_WORKLOAD=";
+/// Set on the virtual screen and everything computer use starts on it (see `desktop`).
+pub(crate) const DESKTOP_MARKER: &str = "CLOUDROOM_DESKTOP";
 const SIGKILL: i32 = 9;
 const SIGCONT: i32 = 18;
 const SIGSTOP: i32 = 19;
@@ -128,13 +130,14 @@ impl Workload {
         })
     }
     /// Idle sleep treats processes beyond the launch count as background jobs. Codex starts its code-mode
-    /// host on the first command and keeps it for the session, so it is harness, not a background job.
+    /// host on the first command and keeps it for the session, so it is harness, not a background job. The
+    /// virtual screen and its browser are neither: an open page alone never keeps the sandbox awake.
     pub fn process_count(&self) -> Option<usize> {
         Some(
             self.pids()
                 .ok()?
                 .iter()
-                .filter(|pid| !helper(**pid))
+                .filter(|pid| !helper(**pid) && !desktop(**pid))
                 .count(),
         )
     }
@@ -292,6 +295,21 @@ fn helper(pid: i32) -> bool {
         let program = cmdline.split(|b| *b == 0).next().unwrap_or_default();
         program.rsplit(|b| *b == b'/').next() == Some(b"codex-code-mode-host".as_slice())
     })
+}
+/// Computer use marks the virtual screen, its helpers and the apps it launches (Chromium included) with
+/// `CLOUDROOM_DESKTOP=1`; browser-harness runs its daemon as `python -m browser_harness.daemon`. For idle sleep
+/// only: the disk guard still sees them. An unreadable environment counts as a background job, as before.
+fn desktop(pid: i32) -> bool {
+    let marked = fs::read(format!("/proc/{pid}/environ")).is_ok_and(|environ| {
+        environ
+            .split(|b| *b == 0)
+            .any(|var| var.strip_prefix(DESKTOP_MARKER.as_bytes()) == Some(b"=1".as_slice()))
+    });
+    marked
+        || fs::read(format!("/proc/{pid}/cmdline")).is_ok_and(|cmdline| {
+            let args: Vec<&[u8]> = cmdline.split(|b| *b == 0).skip(1).take(2).collect();
+            args == [b"-m".as_slice(), b"browser_harness.daemon".as_slice()]
+        })
 }
 /// A process's group and start time, from `/proc/PID/stat`.
 fn stat(pid: i32) -> Option<(i32, u64)> {

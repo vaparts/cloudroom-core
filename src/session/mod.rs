@@ -153,6 +153,23 @@ pub struct Session {
     // The latest turn stopped on a subscription usage limit.
     #[serde(skip)]
     usage_limited: bool,
+    // When that limit resets, if the harness said; a website loop resumes the thread then (accounts.rs).
+    #[serde(skip)]
+    usage_resets_ms: Option<u64>,
+    // The pending website loop that will resume this thread, and how many resumes ran since a turn completed.
+    #[serde(skip)]
+    resume_loop: Option<String>,
+    // Loops retired (their limit ended or was replaced), still to be removed from the website.
+    #[serde(skip)]
+    resume_spent: Vec<String>,
+    // Counts plan limits, so a loop the website answers for an earlier one is retired, never reused.
+    #[serde(skip)]
+    limit_episode: u64,
+    #[serde(skip)]
+    limit_resumes: u32,
+    // The website refused this limit's loop (an archived thread, 100 loops); the next limit tries again.
+    #[serde(skip)]
+    resume_refused: bool,
     #[serde(skip)]
     awake: Option<sleep::Awake>,
     // The harness was asked to exit so this idle session can sleep.
@@ -280,6 +297,8 @@ impl From<io::Error> for Error {
         Self::Storage(error.to_string())
     }
 }
+/// The most text one message to an agent can carry (ADR 0269).
+pub const MAX_PROMPT: usize = 256 * 1024;
 const JOURNAL_UNWRITABLE: &str = "session journal is not writable";
 type Result<T> = std::result::Result<T, Error>;
 
@@ -1051,6 +1070,13 @@ impl Manager {
             }
             if self.is_stopping() {
                 return Err(Error::Conflict("service is stopping"));
+            }
+            // A resume prompt runs only from the current limit's own loop, while that limit still stops the thread:
+            // a retired loop's run, or one sent after the user moved on or stopped it, is refused (accounts.rs).
+            if command == "prompt" && !session.resume_accepts(&request, &input) {
+                return Err(Error::Conflict(
+                    "this thread is no longer stopped by a plan limit",
+                ));
             }
             if command == "sleep" {
                 return self.request_sleep(&mut local, id, request);
@@ -2144,8 +2170,12 @@ impl Manager {
             runtime::Event::Finished {
                 request,
                 status,
-                error,
+                mut error,
             } => {
+                // Only a loop that will fire may promise a resume time.
+                if local.sessions[id].limit_resumes >= accounts::MAX_RESUMES {
+                    error = error.map(accounts::unpromise);
+                }
                 if local.sessions[id].current_request.as_deref() == Some(&request) {
                     let session = &local.sessions[id];
                     let checkpoint = session

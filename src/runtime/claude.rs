@@ -586,6 +586,8 @@ pub(super) struct Protocol {
     bootstrapped: bool,
     close_confirmed: bool,
     last_result_failed: bool,
+    // Claude's plan limit rejected this turn: when it resets, if Claude said (ms).
+    limit: Option<Option<u64>>,
     message_id: String,
     blocks: HashMap<u64, Value>,
     streamed: HashSet<String>,
@@ -616,6 +618,7 @@ impl Protocol {
             bootstrapped: false,
             close_confirmed: false,
             last_result_failed: false,
+            limit: None,
             message_id: String::new(),
             blocks: HashMap::new(),
             streamed: HashSet::new(),
@@ -644,12 +647,12 @@ impl Protocol {
             }
             Some("notifications/initialized") => json!({}),
             Some("tools/list") => {
-                json!({"tools":[{"name":"delegate","description":"Run a separately managed Cloudroom child agent in this workspace. Returns its result and session ID. The child has independent history and controls.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":32768}},"required":["prompt"],"additionalProperties":false}}]})
+                json!({"tools":[{"name":"delegate","description":"Run a separately managed Cloudroom child agent in this workspace. Returns its result and session ID. The child has independent history and controls.","inputSchema":{"type":"object","properties":{"prompt":{"type":"string","minLength":1,"maxLength":crate::session::MAX_PROMPT}},"required":["prompt"],"additionalProperties":false}}]})
             }
             Some("tools/call") if message["params"]["name"] == "delegate" => {
                 let prompt = message["params"]["arguments"]["prompt"]
                     .as_str()
-                    .filter(|p| !p.trim().is_empty() && p.len() <= 32768);
+                    .filter(|p| !p.trim().is_empty() && p.len() <= crate::session::MAX_PROMPT);
                 if let (Some(prompt), Some((_, active))) = (
                     prompt,
                     self.active.as_ref().filter(|(_, active)| {
@@ -673,7 +676,7 @@ impl Protocol {
                         prompt: prompt.into(),
                     })]);
                 }
-                json!({"isError":true,"content":[{"type":"text","text":"Delegation requires an active parent and a non-empty prompt of at most 32768 bytes."}]})
+                json!({"isError":true,"content":[{"type":"text","text":"Delegation requires an active parent and a non-empty prompt of at most 262144 bytes."}]})
             }
             _ => {
                 json!({"isError":true,"content":[{"type":"text","text":"Unsupported Cloudroom tool operation"}]})
@@ -1040,6 +1043,17 @@ impl Adapter for Protocol {
                 events.push(Event::Record{kind:"item_completed",data:json!({"harness":"claude-code","request_id":request,"item_id":id,"item_type":"tool_use","tool_name":self.tools.get(id),"result":block["content"],"is_error":block["is_error"]}),native:None});
             }
         }
+        // A hard rejection, as the app's Local Claude reads it: over the plan limit, with no overage to fall back on.
+        let info = &value["rate_limit_info"];
+        if kind == "rate_limit_event"
+            && info["status"] == "rejected"
+            && !matches!(
+                info["overageStatus"].as_str(),
+                Some("allowed" | "allowed_warning")
+            )
+        {
+            self.limit = Some(info["resetsAt"].as_u64().map(|s| s * 1000));
+        }
         if kind == "result" {
             self.last_result_failed = value["is_error"] == true;
             let ids: HashSet<&str> = value["user_message_uuids"]
@@ -1100,7 +1114,11 @@ impl Adapter for Protocol {
                 {
                     events.push(Event::Authentication { accepted: true });
                 }
-                let error = (status == "failed").then(|| result_error(value));
+                let mut error = (status == "failed").then(|| result_error(value));
+                if let (Some(resets), Some(text)) = (self.limit.take(), &mut error) {
+                    events.push(super::plan_limited("claude-code", resets));
+                    *text = super::plan_limit_error("Claude", resets, text);
+                }
                 events.extend(state.finished(status, error));
                 self.active = None;
                 self.children.clear();
