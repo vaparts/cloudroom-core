@@ -367,6 +367,10 @@ export class CloudroomClient {
     return value as unknown as VmRunResult;
   }
 
+  async reportMac(report: { access: string; problem: string | null }): Promise<void> {
+    await this.#json("/v1/mac/helper", report);
+  }
+
   async #request(
     path: string,
     body?: Json,
@@ -577,7 +581,7 @@ export class CloudroomClient {
     }
   }
 
-  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string; parent_session?: string; parent_thread?: string; prompt?: string; title?: string; fork?: { session: string; before?: string; last_turn_id?: string } } = {}) {
+  start(id: string, harness: Harness = "codex", options: { model?: string; reasoning?: string; workspace?: string; workspace_name?: string; provider?: string; command_guard_enabled?: boolean; strip_ai_co_authors?: boolean; system_prompt?: string; parent_session?: string; parent_thread?: string; prompt?: string; title?: string; fork?: { session: string; fresh?: boolean; before?: string; last_turn_id?: string } } = {}) {
     if (harness !== "codex" && harness !== "pi" && harness !== "cursor" && harness !== "claude-code" && harness !== "fx" && harness !== "opencode" && harness !== "hermes" && harness !== "devin" && harness !== "openclaw")
       throw new CloudroomError("Unsupported Cloudroom harness");
     return this.#command("/v1/sessions", "start", { request_id: id, harness, ...options });
@@ -590,8 +594,8 @@ export class CloudroomClient {
     reasoning?: string,
     extra: { content?: Json; attachments?: Json; service_tier?: string } = {},
   ) {
-    if ((!prompt.trim() && extra.attachments === undefined) || new TextEncoder().encode(prompt).length > 32768) {
-      throw new CloudroomError("Prompt must contain 1–32768 bytes of text", 400);
+    if ((!prompt.trim() && extra.attachments === undefined) || new TextEncoder().encode(prompt).length > 256 * 1024) {
+      throw new CloudroomError("Prompt must contain 1–262144 bytes of text", 400);
     }
     return this.#command(
       `${sessionPath(sessionId)}/prompts`,
@@ -649,8 +653,8 @@ export class CloudroomClient {
   }
 
   steer(sessionId: string, id: string, targetRequestId: string, text: string) {
-    if (!text.trim() || new TextEncoder().encode(text).length > 32768) {
-      throw new CloudroomError("Prompt must contain 1–32768 bytes of text", 400);
+    if (!text.trim() || new TextEncoder().encode(text).length > 256 * 1024) {
+      throw new CloudroomError("Prompt must contain 1–262144 bytes of text", 400);
     }
     return this.#command(
       `${sessionPath(sessionId)}/steer`,

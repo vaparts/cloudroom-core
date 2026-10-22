@@ -111,5 +111,21 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(slow.result()[0], 405)
 
 
+class MacJobTests(unittest.TestCase):
+    def test_job_core_gave_up_on_never_runs(self):
+        # Feedback #247: a slow Mac ran a --write job after Core told the agent "Mac unavailable", so a retry ran it twice.
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            preview.save(folder / 'config.json', {'macAccess': 'full'})
+            posted = []
+            def fetch(url, body, *_):
+                posted.append(body['state'])
+                raise preview.ControlError(404)  # Core already dropped the unconfirmed job.
+            core = SimpleNamespace(url='http://core', headers={}, connection={}, fetch=fetch, key='core')
+            preview.MacJobs(folder).execute(core, 'mac', {'id': 'job', 'command': f'touch {folder}/ran', 'write': True})
+            self.assertFalse((folder / 'ran').exists())
+            self.assertEqual(posted, ['running'])
+
+
 if __name__ == '__main__':
     unittest.main()

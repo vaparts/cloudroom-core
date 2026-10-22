@@ -137,7 +137,7 @@ async fn receive(
     let text = match input.action.as_str() {
         "tell" => input
             .text
-            .filter(|t| !t.trim().is_empty() && t.len() <= 32768)
+            .filter(|t| !t.trim().is_empty() && t.len() <= super::MAX_PROMPT)
             .ok_or_else(|| bad("invalid text"))?,
         "report" => {
             let child = input.child.filter(|c| thread_id(c));

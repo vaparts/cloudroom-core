@@ -169,10 +169,13 @@ pub struct Spawn {
 
 /// A side chat's source (ADR 0189): `session`'s conversation, cut before user message `before`
 /// (Claude Code) or after turn `last_turn_id` (Codex). Without either, the whole conversation.
+/// A `fresh` side chat (ADR 0273) copies no conversation: a new agent in the source's folder.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct ForkFrom {
     pub session: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub fresh: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub before: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +235,9 @@ pub(super) fn fork_history(
         return Ok(None);
     }
     let fork: ForkFrom = serde_json::from_value(fork.clone())?;
+    if fork.fresh {
+        return Ok(None);
+    }
     let source = local.sessions.get(&fork.session).and_then(|s| s.resume());
     Ok(Some(runtime::Fork {
         source: source.ok_or_else(|| io::Error::other("the side chat's source is unavailable"))?,
@@ -294,6 +300,16 @@ pub(super) fn notice(
         "interrupted" => format!(
             "[Cloudroom] Child thread {name} was interrupted. If the user stopped it, do not restart or replace its work unless they ask."
         ),
+        // It continues by itself at the reset or after an account switch (accounts.rs).
+        _ if error
+            .as_deref()
+            .is_some_and(|e| e.contains(crate::runtime::PLAN_LIMIT)) =>
+        {
+            format!(
+                "[Cloudroom] Child thread {name} failed or its outcome is uncertain. Cause: {} Do not resend its task.",
+                error.unwrap_or_default().trim()
+            )
+        }
         _ => {
             let cause = error.map_or(String::new(), |e| {
                 let oom = if e.contains("signal 9") {
@@ -504,6 +520,7 @@ impl Manager {
                 "the side chat's source thread was not found",
             ))?;
             let checkpoint_fits = match s.harness {
+                _ if fork.fresh => fork.before.is_none() && fork.last_turn_id.is_none(),
                 runtime::Kind::Claude => fork.last_turn_id.is_none(),
                 runtime::Kind::Codex => fork.before.is_none(),
                 _ => return Err(Error::Conflict("side chats support Claude Code and Codex")),
@@ -530,12 +547,16 @@ impl Manager {
                     .map(|r| (id.clone(), r))
                     .ok_or(Error::Conflict("session already exists"));
             }
-            if s.resume().is_none() || s.rewind_request.is_some() {
+            if !fork.fresh && (s.resume().is_none() || s.rewind_request.is_some()) {
                 return Err(Error::Conflict(
                     "the source thread has no saved conversation yet",
                 ));
             }
-            if fork.before.is_none() && fork.last_turn_id.is_none() && (s.busy() || s.compacting) {
+            if !fork.fresh
+                && fork.before.is_none()
+                && fork.last_turn_id.is_none()
+                && (s.busy() || s.compacting)
+            {
                 return Err(Error::Conflict(
                     "the source agent is busy; fork from an earlier message or try again shortly",
                 ));

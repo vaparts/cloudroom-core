@@ -46,6 +46,7 @@ pub const FEATURES: &[&str] = &[
     "rewind",
     "fork",
     "side_chat",
+    "side_chat_fresh",
     "attachments",
     "upload_parts",
     "compact",
@@ -58,6 +59,7 @@ pub const FEATURES: &[&str] = &[
     "drain",
     "terminals",
     "files_wait",
+    "long_prompts",
 ];
 
 pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error::Error>> {
@@ -80,6 +82,7 @@ pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error:
     }
     manager.start_storage_guard();
     manager.start_idle_sleeper();
+    manager.start_limit_resumer();
     manager.start_uploader();
     manager.start_auth_monitor();
     eprintln!("Cloudroom listening on {}", listener.local_addr()?);

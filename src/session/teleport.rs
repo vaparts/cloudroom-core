@@ -159,7 +159,7 @@ fn validate(manifest: &Manifest) -> Result<()> {
         || manifest.queued.iter().any(|prompt| {
             prompt.input()["text"]
                 .as_str()
-                .is_none_or(|text| text.is_empty() || text.len() > 32768)
+                .is_none_or(|text| text.is_empty() || text.len() > super::MAX_PROMPT)
         })
         || manifest
             .files

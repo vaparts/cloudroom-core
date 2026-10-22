@@ -53,7 +53,7 @@ export default function (pi: ExtensionAPI) {
     name: "cloudroom_subagent",
     label: "Cloudroom child agent",
     description: "Run a child agent through Cloudroom on this machine, in the same workspace and with the same model. Returns its result and saved session ID.",
-    parameters: Type.Object({ prompt: Type.String({ minLength: 1, maxLength: 32768 }) }),
+    parameters: Type.Object({ prompt: Type.String({ minLength: 1, maxLength: 262144 }) }),
     async execute(toolCallId, { prompt }, signal) {
       signal?.throwIfAborted();
       const id = randomUUID();

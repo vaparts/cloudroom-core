@@ -4,6 +4,7 @@ use super::{
 use crate::config::{Config, HarnessConfig};
 use serde_json::{Value, json};
 use std::{
+    collections::HashMap,
     fs::File,
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
@@ -332,6 +333,12 @@ pub(super) struct Protocol {
     prompt_id: Option<u64>,
     forking: Option<u64>,
     compaction: Option<(u64, Option<String>)>,
+    // Each limit bucket's latest primary and secondary windows. An update without one keeps it, as the app does.
+    windows: HashMap<String, [Value; 2]>,
+    // The bucket Codex updated last: the active model's.
+    bucket: String,
+    // The running turn hit the plan limit.
+    limited: bool,
 }
 impl Protocol {
     pub fn new(
@@ -349,6 +356,9 @@ impl Protocol {
             prompt_id: None,
             forking: None,
             compaction: None,
+            windows: HashMap::new(),
+            bucket: "codex".into(),
+            limited: false,
         }
     }
 }
@@ -499,16 +509,22 @@ impl Adapter for Protocol {
             state.native_turn = Some(turn.into());
             events.extend(state.started());
         }
+        if method == "account/rateLimits/updated" {
+            let limits = &params["rateLimits"];
+            self.bucket = limits["limitId"].as_str().unwrap_or("codex").to_owned();
+            let saved = self.windows.entry(self.bucket.clone()).or_default();
+            for (slot, key) in saved.iter_mut().zip(["primary", "secondary"]) {
+                if !limits[key].is_null() {
+                    *slot = limits[key].clone();
+                }
+            }
+        }
         let limited = Some(&json!("usageLimitExceeded"));
         if root
             && (params.pointer("/turn/error/codexErrorInfo") == limited
                 || params.pointer("/error/codexErrorInfo") == limited)
         {
-            events.push(Event::Record {
-                kind: "usage_limited",
-                data: json!({"harness":"codex"}),
-                native: None,
-            });
+            self.limited = true;
         }
         match if root { method } else { "" } {
             "turn/started" => {
@@ -549,10 +565,25 @@ impl Adapter for Protocol {
                     == state.native_turn.as_deref()
                     && state.native_turn.is_some() =>
             {
-                let error = params
+                let mut error = params
                     .pointer("/turn/error/message")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                if std::mem::take(&mut self.limited) {
+                    // The latest exhausted window of the global bucket and the active one: a weekly window
+                    // outlasts the 5-hour one, and another model's bucket does not apply.
+                    let resets = ["codex", self.bucket.as_str()]
+                        .iter()
+                        .filter_map(|b| self.windows.get(*b))
+                        .flatten()
+                        .filter(|w| w["usedPercent"].as_f64().is_some_and(|p| p >= 100.0))
+                        .filter_map(|w| w["resetsAt"].as_u64())
+                        .max()
+                        .map(|s| s * 1000);
+                    events.push(super::plan_limited("codex", resets));
+                    let said = error.as_deref().unwrap_or("usage limit reached");
+                    error = Some(super::plan_limit_error("Codex", resets, said));
+                }
                 events.extend(state.finished(
                     params["turn"]["status"].as_str().unwrap_or("unknown"),
                     error,

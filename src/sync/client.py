@@ -36,6 +36,11 @@ def private_json(path):
         return json.load(source)
 
 
+def tls():
+    bundled = os.path.join(sys.prefix, 'cacert.pem')
+    return ssl.create_default_context(cafile=bundled if os.path.isfile(bundled) and not os.environ.get('SSL_CERT_FILE') else None)
+
+
 class Remote:
     def __init__(self, connection, device):
         parsed = urllib.parse.urlsplit(connection['url'])
@@ -49,7 +54,7 @@ class Remote:
             raise ValueError('invalid hosting gate token')
         self.url, self.device = connection['url'].rstrip('/'), device
         self.headers = {'Authorization': 'Bearer ' + token, **({'Cookie': '_port_auth=' + gate} if gate else {})}
-        self.opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=ssl.create_default_context()))
+        self.opener = urllib.request.build_opener(NoRedirect(), urllib.request.HTTPSHandler(context=tls()))
 
     def request(self, path, body=None, method=None, headers=None, timeout=60):
         request = urllib.request.Request(self.url + path, data=body, method=method, headers={**self.headers, **(headers or {})})
