@@ -60,18 +60,26 @@ class ControlError(ValueError):
 
 
 # HTTPS settings. urllib reads the macOS proxy setting only when these are built, so the helper rebuilds them while it
-# can't connect: turning off a VPN or proxy then needs no restart (#109). Certificates come from Python's own OpenSSL
-# file, never the macOS Keychain.
+# can't connect: turning off a VPN or proxy then needs no restart (#109). Certificates come from the list shipped next to
+# Cloudroom's Python (cacert.pem), else Python's own OpenSSL file, never the macOS Keychain.
 NET = {}
 NETWORK_SECONDS = 30
 # Wakes job streams waiting to retry when the app asks to check again.
 NUDGE = threading.Condition()
 # Proxies such as Cloudflare refuse urllib's default User-Agent, so the helper names itself on every request.
 USER_AGENT = 'Cloudroom-Helper'
+# Mac commands' curl and git verify with the macOS trust store, which blocks leaked CA keys such as eMudhra's.
+if sys.platform == 'darwin':
+    os.environ.setdefault('CURL_SSL_BACKEND', 'secure-transport')
+
+
+def tls():
+    bundled = os.path.join(sys.prefix, 'cacert.pem')
+    return ssl.create_default_context(cafile=bundled if os.path.isfile(bundled) and not os.environ.get('SSL_CERT_FILE') else None)
 
 
 def network():
-    context, proxies = ssl.create_default_context(), urllib.request.getproxies()
+    context, proxies = tls(), urllib.request.getproxies()
     opener = urllib.request.build_opener(NoRedirect(), urllib.request.ProxyHandler(proxies), urllib.request.HTTPSHandler(context=context))
     opener.addheaders = [('User-Agent', USER_AGENT)]
     NET.update(opener=opener, proxies=proxies, cas=context.cert_store_stats()['x509_ca'], at=time.monotonic())
@@ -444,7 +452,7 @@ class Relay:
         url = urllib.parse.urlsplit(self.core.url)
         remote = socket.create_connection((url.hostname, url.port or (443 if url.scheme == 'https' else 80)), timeout=10)
         if url.scheme == 'https':
-            remote = ssl.create_default_context().wrap_socket(remote, server_hostname=url.hostname)
+            remote = tls().wrap_socket(remote, server_hostname=url.hostname)
         headers = ''.join(f'{key}: {value}\r\n' for key, value in {'User-Agent': USER_AGENT, **self.core.headers}.items())
         remote.sendall(f'GET /v1/previews/{self.port}/tunnel?device={self.device} HTTP/1.1\r\nHost: {url.netloc}\r\n'
                        f'Connection: Upgrade\r\nUpgrade: {protocol}\r\n{headers}\r\n'.encode())
@@ -596,12 +604,27 @@ MAC_LIMIT = 16 * 1024 * 1024
 MAC_LEVELS = ('off', 'read-only', 'ask', 'full')
 # Read-only commands (ADR 0186): no file writes outside temp folders, no signals to other processes, and no tools that
 # drive apps or system settings. macOS also refuses setuid tools like ps and top here; pgrep and lsof still work.
+# They also cannot reach this Mac's own servers and sockets (the app's local API, ssh-agent, Docker; DNS still works) or
+# read Cloudroom's folder beyond its tools, so they cannot act through the app or its tokens (ADR 0260). The internet works.
 READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
              '(allow file-write* (subpath "/private/tmp") (subpath "/private/var/folders") (literal "/dev/null") (literal "/dev/zero")'
              ' (literal "/dev/dtracehelper") (regex #"^/dev/tty") (regex #"^/dev/fd/"))'
              '(deny signal (target others))'
              '(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/usr/bin/shortcuts")'
-             ' (literal "/usr/bin/automator") (literal "/bin/launchctl") (literal "/usr/bin/tccutil") (literal "/usr/bin/defaults"))')
+             ' (literal "/usr/bin/automator") (literal "/bin/launchctl") (literal "/usr/bin/tccutil") (literal "/usr/bin/defaults"))'
+             # Seatbelt's localhost misses IPv4-mapped IPv6 like ::ffff:127.0.0.1, so IPv6 is blocked outright and clients fall
+             # back to IPv4. It must be ip4 here: next to an ip6 rule, (remote ip "localhost:*") stops matching 127.0.0.1.
+             '(deny network-outbound (remote ip4 "localhost:*") (remote ip6 "*:*") (remote unix-socket))'
+             '(allow network-outbound (literal "/private/var/run/mDNSResponder"))'
+             '(deny file-read* (subpath (param "DATA")))'
+             '(allow file-read* (literal (param "DATA")) (subpath (param "DATA_BIN")) (subpath (param "DATA_HARNESS")))')
+
+
+def read_only(data):
+    """sandbox-exec arguments for a read-only command; `data` is Cloudroom's folder, which holds its tokens."""
+    data = data.resolve()  # Seatbelt matches real paths.
+    params = {'DATA': data, 'DATA_BIN': data / 'bin', 'DATA_HARNESS': data / 'browser-harness'}
+    return ['/usr/bin/sandbox-exec', *(arg for key, path in params.items() for arg in ('-D', f'{key}={path}')), '-p', READ_ONLY]
 ASK = '''on run argv
 activate
 display dialog (item 1 of argv) with title "Cloudroom" buttons {"Allow", "Allow for this thread", "Deny"} default button "Deny" cancel button "Deny" with icon caution giving up after 300
@@ -812,7 +835,8 @@ class MacJobs:
         sandboxed = not refused and not job.get('write') and mac_level(self.enabled() or {}) != 'full'
         login = pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh'
         # Cloudroom's own tools (browser-harness) come first, as in Local threads, after the user's profile sets PATH.
-        tools = shlex.quote(str(Path(core.config['connectionFile']).parent / 'bin'))
+        data = Path(core.config['connectionFile']).parent
+        tools = shlex.quote(str(data / 'bin'))
         path = f'set -gx PATH {tools} $PATH; ' if login.endswith('/fish') else f'PATH={tools}:"$PATH"; '
         shell = [login, '-lc', path + job['command']]
         try:
@@ -823,7 +847,7 @@ class MacJobs:
                 if job['id'] in self.cancelled:
                     self.cancelled.discard(job['id'])
                     raise PermissionError('The agent stopped this command before it started, so it did not run.')
-                process = subprocess.Popen(['/usr/bin/sandbox-exec', '-p', READ_ONLY, *shell] if sandboxed else shell, cwd=folder,
+                process = subprocess.Popen([*read_only(data), *shell] if sandboxed else shell, cwd=folder,
                                            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE, start_new_session=True)
                 self.running[job['id']] = process
         except OSError as error:
@@ -847,9 +871,12 @@ class MacJobs:
                 thread.join(2)  # A background process may keep the pipe open.
             with self.lock:
                 self.running.pop(job['id'], None)
-            if sandboxed and result['code'] and b'not permitted' in output['stderr'].lower():
-                output['stderr'] += (b'\nCloudroom: Mac access is Read-only, so commands cannot change the Mac.\n' if mac_level(self.enabled() or {}) == 'read-only'
-                                     else b'\nCloudroom: this ran read-only. To change the Mac, rerun with `room-cli mac run --write ...`; the user approves it first.\n')
+            # Blocked local connections fail as EPERM, or as curl's "couldn't connect".
+            if sandboxed and result['code'] and any(sign in output['stderr'].lower() for sign in (b'not permitted', b'eperm', b"couldn't connect")):
+                output['stderr'] += (b"\nCloudroom: Mac access is Read-only, so commands cannot change the Mac, reach its local servers or sockets, or read Cloudroom's files.\n"
+                                     if mac_level(self.enabled() or {}) == 'read-only' else
+                                     b"\nCloudroom: this ran read-only, without this Mac's local servers, sockets, or Cloudroom's files. To change the Mac or reach them, "
+                                     b'rerun with `room-cli mac run --write ...`; the user approves it first.\n')
             result['truncated'] = any(len(value) > MAC_LIMIT for value in output.values())
             result.update({name: bytes(value[:MAC_LIMIT]).hex() for name, value in output.items()})
         # The result survives disconnects: retry until the VM accepts it, forgets the job, or an hour passes.

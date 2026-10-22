@@ -49,6 +49,12 @@ const FRESH: Duration = Duration::from_secs(60);
 const ATTACH: Duration = Duration::from_secs(30);
 const UNAVAILABLE: &str = "Mac unavailable: the paired Mac is offline, asleep, or has Mac access turned off. Continue cloud work and try again later.";
 const NOT_RESPONDING: &str = "Mac not responding: the paired Mac is connected but did not pick up this command in time. It may be asleep, very busy, or on a slow connection. Continue cloud work and try again later.";
+/// For `mac status`, which sends no command: the helper is connected, but the last command went unanswered.
+const STALE: &str = "Mac not responding: the paired Mac is connected but did not pick up the last command in time. It may be asleep, very busy, or on a slow connection. Continue cloud work and try again later.";
+/// The helper connection changed while this command waited for it to confirm the command.
+const RECONNECTED: &str = "Mac unavailable: the connection to the Mac restarted while this command was starting. Run it again.";
+/// The Mac app resends its report every minute, so an older one may describe a Mac that has since slept.
+const REPORTED: Duration = Duration::from_secs(150);
 pub const SKILL: &str = include_str!("cloud-mac/SKILL.md");
 pub const ROOM_CLI_SKILL: &str = include_str!("room-cli/SKILL.md");
 
@@ -83,6 +89,13 @@ pub struct Report {
 pub struct Device {
     device: String,
 }
+/// What the user's Mac app sees of Mac access (#109). The app reaches this sandbox even when the Mac's helper can't,
+/// so agents learn why the Mac is unavailable. `problem` is the short reason Settings shows, never technical detail.
+#[derive(Deserialize)]
+pub struct AppReport {
+    access: String,
+    problem: Option<String>,
+}
 
 struct Job {
     device: String,
@@ -106,6 +119,9 @@ pub struct Mac {
     changed: watch::Sender<u64>,
     next: AtomicU64,
     since: Mutex<Instant>,
+    /// When the helper last disconnected; None if it hasn't connected since Core started.
+    left: Mutex<Option<Instant>>,
+    report: Mutex<Option<(AppReport, Instant)>>,
 }
 impl Default for Mac {
     fn default() -> Self {
@@ -115,6 +131,8 @@ impl Default for Mac {
             changed: watch::channel(0).0,
             next: AtomicU64::new(0),
             since: Mutex::new(Instant::now()),
+            left: Mutex::default(),
+            report: Mutex::default(),
         }
     }
 }
@@ -132,6 +150,36 @@ impl Mac {
             .unwrap()
             .as_ref()
             .is_some_and(|h| h.generation == generation)
+    }
+    /// Why agents can't reach the Mac: the newest thing Core or the Mac app knows (#109).
+    fn unavailable(&self) -> String {
+        match self.helper.lock().unwrap().as_ref().map(|h| h.stale) {
+            Some(true) => return STALE.into(),
+            Some(false) => return RECONNECTED.into(),
+            None => {}
+        }
+        let left = *self.left.lock().unwrap();
+        let since = left.map_or(String::new(), |at| {
+            format!(" (last connected {} ago)", ago(at))
+        });
+        // A report from before the Mac last dropped off can't know about the drop: a sleeping Mac sends none.
+        let after = |at: &Instant| left.is_none_or(|left| *at > left);
+        let reported = self.report.lock().unwrap();
+        match reported.as_ref().filter(|(_, at)| at.elapsed() < REPORTED) {
+            Some((report, _)) if report.access == "off" => "Mac unavailable: the user turned Mac access off. If you need their Mac, ask them to turn it on in Cloudroom; otherwise continue cloud work.".into(),
+            Some((AppReport { problem: Some(problem), .. }, at)) if after(at) => format!("Mac unavailable: the user's Mac is online, but Mac access can't connect to Cloudroom{since}. Cloudroom shows them why in Settings → Machines, with a Check now link: {problem} Continue cloud work; mention it only if you need their Mac."),
+            Some((_, at)) if after(at) => format!("Mac unavailable: the user's Mac is online with Mac access on, but it isn't connected to this sandbox{since}. If it doesn't connect within a few minutes, the user can restart Cloudroom on their Mac. Continue cloud work meanwhile."),
+            _ => left.map_or(UNAVAILABLE.into(), |at| format!("Mac unavailable: the paired Mac disconnected {} ago. It may be asleep, offline, or have Mac access turned off. Continue cloud work and try again later.", ago(at))),
+        }
+    }
+}
+
+fn ago(at: Instant) -> String {
+    match at.elapsed().as_secs() / 60 {
+        0 => "less than a minute".into(),
+        1 => "1 minute".into(),
+        minutes @ ..120 => format!("{minutes} minutes"),
+        minutes => format!("{} hours", minutes / 60),
     }
 }
 
@@ -202,6 +250,7 @@ impl Drop for Cancel {
 pub fn routes() -> Router<Arc<Manager>> {
     Router::new()
         .route("/v1/mac/jobs", get(stream))
+        .route("/v1/mac/helper", post(app_report))
         .route(
             "/v1/mac/results/{id}",
             post(report).layer(DefaultBodyLimit::max(BODY)),
@@ -214,6 +263,18 @@ pub fn routes() -> Router<Arc<Manager>> {
             "/v1/vm/run/raw",
             post(vm_run_raw).layer(DefaultBodyLimit::max(LIMIT)),
         )
+}
+
+/// The Mac app reports what it sees of Mac access, on change and every few minutes (#109).
+async fn app_report(
+    State(m): State<Arc<Manager>>,
+    Json(input): Json<AppReport>,
+) -> Result<(StatusCode, Json<Value>)> {
+    if input.access.len() > 32 || input.problem.as_ref().is_some_and(|p| p.len() > 2048) {
+        return Err(conflict("Invalid Mac access report"));
+    }
+    *m.mac.report.lock().unwrap() = Some((input, Instant::now()));
+    Ok((StatusCode::ACCEPTED, Json(json!({"accepted":true}))))
 }
 
 /// The paired Mac's helper receives jobs here. The newest connection replaces older ones.
@@ -243,6 +304,7 @@ async fn stream(
         if helper.as_ref().is_some_and(|h| h.generation == generation) {
             *helper = None;
             mac.mac.expect();
+            *mac.mac.left.lock().unwrap() = Some(Instant::now());
         }
         drop(helper);
         mac.mac.touch();
@@ -339,7 +401,7 @@ async fn local_run(
             break (h.generation, h.device.clone(), h.events.clone());
         }
         if Instant::now() >= wait {
-            return Err(conflict(UNAVAILABLE));
+            return Err(Failure(StatusCode::CONFLICT, mac.unavailable()));
         }
         tokio::select! {
             _ = changed.changed() => {},
@@ -374,7 +436,7 @@ async fn local_run(
         .is_err()
     {
         mac.jobs.lock().unwrap().remove(&id);
-        return Err(conflict(UNAVAILABLE));
+        return Err(Failure(StatusCode::CONFLICT, mac.unavailable()));
     }
     let mut cancel = Cancel {
         id: id.clone(),
@@ -386,7 +448,9 @@ async fn local_run(
         let connected = mac.connected(generation);
         {
             let mut jobs = mac.jobs.lock().unwrap();
-            let job = jobs.get(&id).ok_or(conflict(UNAVAILABLE))?;
+            let job = jobs
+                .get(&id)
+                .ok_or_else(|| Failure(StatusCode::CONFLICT, mac.unavailable()))?;
             if let Some(result) = &job.result {
                 cancel.armed = false;
                 let mut result = result.clone();
@@ -404,11 +468,11 @@ async fn local_run(
                 {
                     h.stale = true;
                 }
-                return Err(conflict(if connected {
-                    NOT_RESPONDING
+                return Err(if connected {
+                    conflict(NOT_RESPONDING)
                 } else {
-                    UNAVAILABLE
-                }));
+                    Failure(StatusCode::CONFLICT, mac.unavailable())
+                });
             }
             // In-flight work keeps running on the Mac; its helper reports the result after reconnecting.
             if !connected {
@@ -459,9 +523,18 @@ async fn local_status(
     ConnectInfo(peer): ConnectInfo<Peer>,
 ) -> Result<Json<Value>> {
     local_auth(&m, peer)?;
-    Ok(Json(
-        json!({"connected":m.mac.helper.lock().unwrap().as_ref().is_some_and(|h| !h.stale)}),
-    ))
+    let connected = m
+        .mac
+        .helper
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|h| !h.stale);
+    Ok(Json(if connected {
+        json!({"connected":true})
+    } else {
+        json!({"connected":false,"reason":m.mac.unavailable()})
+    }))
 }
 
 pub async fn listen(manager: &Arc<Manager>) -> io::Result<()> {

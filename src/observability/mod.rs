@@ -326,6 +326,13 @@ impl Observability {
                     eprintln!("Cloudroom diagnostic file write failed");
                 }
                 for record in batch {
+                    // The Mac helper reports once a minute: a good report stays in the local files only, so it adds
+                    // no website rows (db-load-budget).
+                    if matches!(&record.signal, Signal::Api { method, route, status, duration_ms }
+                        if *method == "POST" && route == "/v1/mac/helper" && (200..400).contains(status) && *duration_ms < SLOW_API_MS)
+                    {
+                        continue;
+                    }
                     if let Signal::Api {
                         method,
                         route,

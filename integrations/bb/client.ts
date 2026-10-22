@@ -367,6 +367,10 @@ export class CloudroomClient {
     return value as unknown as VmRunResult;
   }
 
+  async reportMac(report: { access: string; problem: string | null }): Promise<void> {
+    await this.#json("/v1/mac/helper", report);
+  }
+
   async #request(
     path: string,
     body?: Json,

@@ -5,7 +5,7 @@ One internal module; no alerts, external collector, or new dependency. Diagnosti
 ## Recorded data
 
 - `api`: route template, GET/POST/other, HTTP status and response-header latency. SSE timing covers stream setup, not its lifetime. `X-Cloudroom-Diagnostic-Id` matches the individual local record's `run_id-sequence`. Uploads keep individual errors, requests taking at least one second, and commands. The morning brief counts cloud threads and messages from these command records.
-- `api_summary`: successful GETs and `/v1/sync` POSTs below one second become one uploaded record per method/route/status each minute. It contains request count, total/max latency, and first/last timestamps. Individual requests remain in bounded local logs. Shutdown flushes partial summaries; abrupt process loss can lose buffered counts.
+- `api_summary`: successful GETs and `/v1/sync` POSTs below one second become one uploaded record per method/route/status each minute. Successful `/v1/mac/helper` POSTs are never uploaded. It contains request count, total/max latency, and first/last timestamps. Individual requests remain in bounded local logs. Shutdown flushes partial summaries; abrupt process loss can lose buffered counts.
 - `agent_start`: Cloudroom session ID, initialization success and elapsed milliseconds; not inference response time.
 - `agent_exit`: session ID (`null` for model discovery), harness, fixed reason, expected/technical classification, exit code or signal, stderr byte count, EOF confirmation and truncation flag. Session exit records include the matching `diagnostic_id` (`run_id-sequence`). Normal turn completion is not a crash.
 - `auth_health`: Claude credential-presence checks and the last observed inference authentication outcome; see [login monitoring](#claude-login-monitoring).
@@ -42,7 +42,7 @@ Inspect the existing `cloudroom_diagnostics` table with the owner-scoped query i
 
 ## Protected harness stderr
 
-Raw stderr is untrusted and may contain credentials, prompts or private paths. It never enters ordinary logs, uploads, session history, API responses or SSE. Only the protected service account and authorized administrators should inspect it; the core token does not grant access. Do not automatically include it in support bundles or share it without reviewing/redacting it.
+Raw stderr is untrusted and may contain credentials, prompts or private paths. It stays out of ordinary logs and diagnostic uploads. Failed or lost sessions include a tail of up to 2,000 bytes in the owner's history, saved-history uploads, API responses and SSE (ADR 0123). The core token grants access to this tail; local capture files remain protected. Review/redact stderr before sharing it or including it in support bundles.
 
 - Runtime continuously drains each process in 8 KiB chunks, retaining only the last **16 KiB**. Capture uses bytes, not lines. After workload cleanup it waits at most **250 ms** for EOF, then cancels and joins the reader. `stderr_complete: false` means the reader failed or timed out; `stderr_truncated: true` means earlier bytes were discarded. Neither changes recovery behavior.
 - Nonempty tails are saved once at exit, including graceful exits and startup/resume/model-discovery failures. Errors before a process is spawned have no stderr capture. A still-running process's tail stays in memory; abrupt core termination loses it.

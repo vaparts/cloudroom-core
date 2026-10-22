@@ -17,5 +17,5 @@ description: 'Inspect and control the user’s Cloudroom threads, projects, and 
   ```
 
 - On the Mac, start with `room-cli --help` or `room-cli guide`. Prefer `--json`.
-- `Mac unavailable` means the Mac is offline or Mac access is off. Tell the user.
+- `Mac unavailable` means the Mac is offline or Mac access is off, and says which when Cloudroom knows, including why an online Mac can't connect. `room-cli mac status` gives the same `reason`. Tell the user.
 - Never inspect, message, or launch other threads unless the user asks.
