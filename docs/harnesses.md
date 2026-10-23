@@ -39,7 +39,7 @@ Terminal fallback: run `claude auth login` and `claude auth status` as the confi
 
 Create sessions with `"harness":"claude-code"`. Missing login returns `claude_auth_required` before acceptance; verification failures return `claude_auth_unavailable`. The GUI retains the task and offers **Retry start** after native login. This is login guidance, not an embedded OAuth flow or a live subscription-limit check.
 
-Steering writes the message into the running turn, as Local's Claude does; a steer that misses its turn runs as Claude's own turn. The adapter disables Fast mode, structured questions and hidden native subagents. Delegation uses Cloudroom child sessions through an in-process MCP transport. Hooks/plugins load normally. Startup and context notices use native non-query messages, not inference. Rewind forks conversation history without restoring files; native paths and checkpoints remain adapter-owned.
+Steering writes the message into the running turn, as Local's Claude does; a steer that misses its turn runs as Claude's own turn. The adapter disables Fast mode, structured questions and hidden native subagents. The one exception is a forked skill (such as `/code-review`): its subagent runs inside the Skill call, and only the call's result reaches the conversation. Delegation uses Cloudroom child sessions through an in-process MCP transport. Hooks/plugins load normally. Startup and context notices use native non-query messages, not inference. Rewind forks conversation history without restoring files; native paths and checkpoints remain adapter-owned.
 
 ### Selected skills
 

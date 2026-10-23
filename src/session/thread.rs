@@ -27,6 +27,7 @@ use tokio::sync::oneshot;
 const USAGE: &str = "room-cli thread update --self --title TITLE
 room-cli thread update --self --reasoning-level LEVEL
 room-cli thread archive --self
+room-cli thread move --self --project PROJECT
 room-cli thread stop --self
 room-cli thread spawn --provider codex|claude-code|pi|opencode|hermes|devin|fx|openclaw [--model MODEL] [--reasoning-level LEVEL] [--service-tier default|fast] [--title TITLE] [--shared-sandbox|--top-level] --prompt TEXT|--prompt-file PATH
 room-cli thread fork [--provider codex|claude-code|pi|opencode|hermes|devin|fx|openclaw] [--model MODEL] [--reasoning-level LEVEL] [--title TITLE] --prompt TEXT|--prompt-file PATH
@@ -112,6 +113,12 @@ pub struct ChildAnswer {
 
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
+pub struct Move {
+    project: String,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Effort {
     reasoning: String,
 }
@@ -136,6 +143,7 @@ pub(crate) fn agent_routes() -> Router<Arc<Manager>> {
         .route("/title", post(rename))
         .route("/reasoning", post(set_reasoning))
         .route("/archive", post(archive))
+        .route("/move", post(move_project))
         .route("/children", get(list).post(spawn))
         .route("/fork", post(fork))
         .route("/children/{id}", get(output))
@@ -221,6 +229,28 @@ async fn archive(
     let session = caller(&m, peer, "thread")?;
     archive_under(&m, &session)?;
     record(&m, &session, "archive", json!({"archived":true}))
+}
+
+/// The app moves this thread to another project once its turn ends: a fresh session in that project's folder, in
+/// this sandbox, with the conversation so far (ADR 0281). The old folder stays.
+async fn move_project(
+    State(m): State<Arc<Manager>>,
+    ConnectInfo(peer): ConnectInfo<Peer>,
+    Json(input): Json<Move>,
+) -> Result<Json<Value>, Failure> {
+    let session = caller(&m, peer, "thread")?;
+    let project = input.project.trim();
+    if !valid(project) {
+        return Err(fail(
+            StatusCode::CONFLICT,
+            "Name a project by its ID or name",
+        ));
+    }
+    let _ = record(&m, &session, "move", json!({"project":project}))?;
+    Ok(Json(json!({
+        "project": project,
+        "note": "Cloudroom moves this thread when this turn ends. End your turn now; the next one runs in that project's folder.",
+    })))
 }
 
 /// Stops and archives every thread under `id` now: the app archives them too, but never stops them,
@@ -1067,6 +1097,9 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
             ("/reasoning", Some(json!({"reasoning":level})))
         }
         ["archive", "--self"] => ("/archive", None),
+        ["move", "--self", "--project", project] | ["move", "--project", project, "--self"] => {
+            ("/move", Some(json!({"project":project})))
+        }
         ["stop", "--self"] => {
             println!(
                 "{}",
@@ -1087,7 +1120,7 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         }
         _ => {
             println!(
-                "{USAGE}\nRenames, archives or changes the effort of this cloud thread, or starts, checks, stops and archives its child threads. --top-level starts a top-level thread instead of a child, only when the user asks for one."
+                "{USAGE}\nRenames, archives, moves or changes the effort of this cloud thread, or starts, checks, stops and archives its child threads. --top-level starts a top-level thread instead of a child, only when the user asks for one."
             );
             return Ok(if words.is_empty() { 0 } else { 2 });
         }
