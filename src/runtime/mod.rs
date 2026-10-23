@@ -1055,10 +1055,27 @@ pub(super) fn command(binary: &Path, config: &Config) -> Command {
     // The user's own variables from Cloud environment settings, one NAME=value per line. Read at every
     // start, so saved changes reach new agents at once. Core's own values below win over them.
     let saved = std::fs::read_to_string(config.state_dir.join("environment")).unwrap_or_default();
-    for (name, value) in saved.lines().filter_map(|line| line.split_once('=')) {
-        if !name.is_empty() && !name.contains('\0') && !value.contains('\0') {
-            command.env(name, value);
-        }
+    let saved: Vec<(&str, &str)> = saved
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(name, value)| !name.is_empty() && !name.contains('\0') && !value.contains('\0'))
+        .collect();
+    for (name, value) in &saved {
+        command.env(name, value);
+    }
+    // Memory and CPU limits (linux.rs). The user's own value wins; lists keep it after ours.
+    for (name, value) in linux::agent_env() {
+        match saved
+            .iter()
+            .rev()
+            .find(|(own, _)| own == name)
+            .map(|(_, own)| *own)
+        {
+            None => command.env(name, value),
+            Some(own) if *name == "NODE_OPTIONS" => command.env(name, format!("{value} {own}")),
+            Some(own) if *name == "PYTHONPATH" => command.env(name, format!("{value}:{own}")),
+            Some(_) => &mut command,
+        };
     }
     command
         .env("PATH", path)
