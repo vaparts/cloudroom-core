@@ -592,6 +592,8 @@ pub(super) struct Protocol {
     blocks: HashMap<u64, Value>,
     streamed: HashSet<String>,
     tools: HashMap<String, String>,
+    // Running Skill calls: a forked skill runs as Claude's own subagent inside the call. Unlike `tools`, steering keeps them.
+    skills: HashSet<String>,
     // The last model call's prompt size; `result.usage` sums every call in the turn.
     context: Option<u64>,
 }
@@ -623,8 +625,15 @@ impl Protocol {
             blocks: HashMap::new(),
             streamed: HashSet::new(),
             tools: HashMap::new(),
+            skills: HashSet::new(),
             context: None,
         })
+    }
+    fn track(&mut self, id: &str, name: &str) {
+        if name == "Skill" {
+            self.skills.insert(id.into());
+        }
+        self.tools.insert(id.into(), name.into());
     }
     fn reply_control(id: &str, response: Value) -> Value {
         json!({"type":"control_response","response":{"subtype":"success","request_id":id,"response":response}})
@@ -776,6 +785,11 @@ impl Adapter for Protocol {
             let id = value["request_id"]
                 .as_str()
                 .ok_or_else(|| io::Error::other("missing Claude control identity"))?;
+            if value["request"]["subtype"] == "hook_callback" && !self.skills.is_empty() {
+                self.pending_frames
+                    .push(Self::reply_control(id, json!({"continue":true})));
+                return Ok(events);
+            }
             let response = if value["request"]["subtype"] == "hook_callback" {
                 json!({"continue":false,"stopReason":"Native Claude subagents are disabled. Start a managed child thread with `room-cli thread spawn`."})
             } else {
@@ -813,7 +827,11 @@ impl Adapter for Protocol {
         if kind == "tool_progress" {
             return Ok(events);
         }
-        if value["parent_tool_use_id"].as_str().is_some() {
+        if let Some(parent) = value["parent_tool_use_id"].as_str() {
+            // A forked skill's subagent: its result returns as the Skill call's own result.
+            if self.skills.contains(parent) {
+                return Ok(events);
+            }
             return Err(io::Error::other("unmanaged Claude subagent emitted output"));
         }
         if let Some(id) = value["session_id"].as_str()
@@ -916,7 +934,7 @@ impl Adapter for Protocol {
                     data["input"] = block["input"].clone();
                     data["text"] = json!("");
                     if let Some(name) = block["name"].as_str() {
-                        self.tools.insert(id, name.into());
+                        self.track(&id, name);
                     }
                     self.blocks.insert(index, data.clone());
                     if block["type"] == "tool_use" {
@@ -1014,7 +1032,7 @@ impl Adapter for Protocol {
                         )
                     });
                     if let Some(name) = block["name"].as_str() {
-                        self.tools.insert(id.clone(), name.into());
+                        self.track(&id, name);
                     }
                     let part = json!({"harness":"claude-code","request_id":request,"item_id":id,"item_type":block["type"],"text":block.get("text").or_else(||block.get("thinking")),"tool_name":block["name"],"input":block["input"]});
                     events.push(Event::Record {
@@ -1040,6 +1058,7 @@ impl Adapter for Protocol {
                 .filter(|b| b["type"] == "tool_result")
             {
                 let id = block["tool_use_id"].as_str().unwrap_or("");
+                self.skills.remove(id);
                 events.push(Event::Record{kind:"item_completed",data:json!({"harness":"claude-code","request_id":request,"item_id":id,"item_type":"tool_use","tool_name":self.tools.get(id),"result":block["content"],"is_error":block["is_error"]}),native:None});
             }
         }
@@ -1329,5 +1348,35 @@ pub(super) fn recover(
         if !capture.more {
             return Ok(());
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_forked_skill_subagent_runs_but_other_subagents_still_fail() {
+        let profile = HarnessConfig {
+            binary: "claude".into(),
+            home: "/nonexistent".into(),
+            model: "haiku".into(),
+            provider: None,
+        };
+        let mut claude = Protocol::new(&profile, "s".into(), None, None).unwrap();
+        let mut state = Progress::default();
+        let mut feed = |frame: Value| claude.receive(&frame, frame.to_string(), &mut state);
+        let child = |parent: &str| json!({"type":"assistant","session_id":"s","parent_tool_use_id":parent,"message":{"content":[]}});
+        feed(json!({"type":"stream_event","session_id":"s","parent_tool_use_id":null,"event":{"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"skill","name":"Skill","input":{}}}})).unwrap();
+        feed(json!({"type":"control_request","request_id":"hook","request":{"subtype":"hook_callback","callback_id":"cloudroom-native-child","input":{"hook_event_name":"SubagentStart"}}})).unwrap();
+        assert_eq!(
+            claude.pending_frames[0]["response"]["response"],
+            json!({"continue":true})
+        );
+        let mut feed = |frame: Value| claude.receive(&frame, frame.to_string(), &mut state);
+        feed(child("skill")).unwrap();
+        assert!(feed(child("other")).is_err());
+        feed(json!({"type":"user","session_id":"s","parent_tool_use_id":null,"message":{"content":[{"type":"tool_result","tool_use_id":"skill","content":"done"}]}})).unwrap();
+        assert!(feed(child("skill")).is_err());
     }
 }

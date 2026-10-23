@@ -9,6 +9,83 @@ use std::{
 };
 use tokio::{process::Command, sync::watch};
 
+/// Agent helpers live beside Core's sockets: readable by the agent, writable only by Core's account.
+const AGENT_DIR: &str = "/run/cloudroom/agent";
+/// Sourced by every non-interactive bash a harness starts (BASH_ENV; Claude Code's command shells skip it and source
+/// CLAUDE_ENV_FILE instead), so each command an agent runs, and all it starts, is what the kernel kills first when
+/// memory runs out, never the agent or Core. A harness launched through a bash wrapper (its parent is Core) keeps 0.
+const BASH_ENV: &str = r#"{ read -r _cloudroom_parent < /proc/$PPID/comm; } 2>/dev/null
+[ "$_cloudroom_parent" = cloudroom ] || { echo 500 > /proc/$$/oom_score_adj; } 2>/dev/null
+unset _cloudroom_parent
+"#;
+/// A container's `os.cpus()` lists every host CPU, and tools such as Next.js start a worker per CPU.
+const NODE_CPUS: &str = r#"const os = require('node:os'), cpus = os.cpus, usable = os.availableParallelism?.();
+if (usable) { os.cpus = () => cpus().slice(0, usable); require('node:module').syncBuiltinESMExports(); }
+"#;
+/// Python 3.13 reads PYTHON_CPU_COUNT itself; older versions count every host CPU for worker pools. Then it runs the
+/// `sitecustomize` this one hides (the user's or the system's), since Python loads only the first it finds.
+const PYTHON_CPUS: &str = r#"import importlib.machinery, importlib.util, os, sys
+if sys.version_info < (3, 13) and os.environ.get('PYTHON_CPU_COUNT', '').isdigit():
+    _count = int(os.environ['PYTHON_CPU_COUNT'])
+    os.cpu_count = lambda: _count
+_here = os.path.dirname(os.path.abspath(__file__))
+_next = importlib.machinery.PathFinder.find_spec('sitecustomize', [p for p in sys.path if os.path.abspath(p or '.') != _here])
+if _next and _next.loader:
+    _next.loader.exec_module(importlib.util.module_from_spec(_next))
+"#;
+
+/// Settings for every harness so one agent fits a container with no swap: commands die before the agent, and tools
+/// see the CPUs the container may use instead of the host's. Written once per Core start; nothing outside Linux.
+pub(crate) fn agent_env() -> &'static [(&'static str, String)] {
+    static ENV: std::sync::OnceLock<Vec<(&'static str, String)>> = std::sync::OnceLock::new();
+    ENV.get_or_init(|| {
+        let dir = Path::new(AGENT_DIR);
+        let helpers = write_helpers(dir).is_ok();
+        let mut env = Vec::new();
+        if helpers {
+            let hook = dir.join("bash-env.sh").display().to_string();
+            env.extend([("BASH_ENV", hook.clone()), ("CLAUDE_ENV_FILE", hook)]);
+        }
+        if let Some(cpus) = cpu_quota() {
+            env.push(("OMP_NUM_THREADS", cpus.to_string())); // nproc, make -j$(nproc), OpenMP and BLAS
+            env.push(("PYTHON_CPU_COUNT", cpus.to_string()));
+            if helpers {
+                let node = dir.join("cpus.cjs");
+                env.push(("NODE_OPTIONS", format!("--require {}", node.display())));
+                env.push(("PYTHONPATH", dir.display().to_string()));
+            }
+        }
+        env
+    })
+}
+
+fn write_helpers(dir: &Path) -> io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::create_dir_all(dir)?;
+    fs::set_permissions(dir, fs::Permissions::from_mode(0o755))?;
+    for (name, text) in [
+        ("bash-env.sh", BASH_ENV),
+        ("cpus.cjs", NODE_CPUS),
+        ("sitecustomize.py", PYTHON_CPUS),
+    ] {
+        // Replaced whole, so an agent already running never reads half a file.
+        let temporary = dir.join(format!(".{name}"));
+        fs::write(&temporary, text)?;
+        fs::set_permissions(&temporary, fs::Permissions::from_mode(0o644))?;
+        fs::rename(temporary, dir.join(name))?;
+    }
+    Ok(())
+}
+
+/// The container's CPU quota, rounded up. None without one, where the CPU count tools see is already right.
+fn cpu_quota() -> Option<u64> {
+    let max = fs::read_to_string("/sys/fs/cgroup/cpu.max").ok()?;
+    let mut parts = max.split_whitespace();
+    let quota: u64 = parts.next()?.parse().ok()?;
+    let period: u64 = parts.next()?.parse().ok()?;
+    (period > 0).then(|| quota.div_ceil(period).max(1))
+}
+
 static NEXT: AtomicU64 = AtomicU64::new(0);
 const MARKER: &[u8] = b"CLOUDROOM_WORKLOAD=";
 /// Set on the virtual screen and everything computer use starts on it (see `desktop`).

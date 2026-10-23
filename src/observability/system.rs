@@ -19,6 +19,9 @@ pub(crate) struct Resources {
     cpu_used_percent: Option<f64>,
     memory_total_bytes: Option<u64>,
     memory_used_bytes: Option<u64>,
+    /// Processes the kernel has killed for memory since the container started (its cgroup's `oom_kill`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    oom_kills: Option<u64>,
     workspace_disk: Option<Disk>,
     state_disk: Option<Disk>,
     pub(super) agents: Option<super::metrics::AgentCounts>,
@@ -117,6 +120,7 @@ impl Sampler {
             cpu_used_percent,
             memory_total_bytes,
             memory_used_bytes,
+            oom_kills: cgroup("memory.events").and_then(|s| field(&s, "oom_kill")),
             workspace_disk: disk(&config.repository).ok(),
             state_disk: disk(&config.state_dir).ok(),
             agents: None,
@@ -320,6 +324,7 @@ fn disk_percentage_excludes_reserved_blocks() {
         cpu_used_percent: None,
         memory_total_bytes: None,
         memory_used_bytes: None,
+        oom_kills: None,
         workspace_disk: Some(Disk {
             total_bytes: 80,
             used_bytes: 77,
