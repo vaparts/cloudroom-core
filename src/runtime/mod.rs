@@ -106,8 +106,8 @@ pub fn supports(kind: Kind, models: &[Model], model: &str, reasoning: &str) -> R
 
 pub const PI_REASONING_LEVELS: &[&str] = &["none", "minimal", "low", "medium", "high", "xhigh"];
 
-/// Pi also takes `max`: few Pi models have it, and Kimi K3 has nothing else. Pi itself rejects it for models
-/// without it, and the app's new-thread picker shows only the levels the model has locally.
+/// Pi and fx also take `max`: few models have it, and Kimi has nothing above it. Pi rejects it for models without it,
+/// fx keeps its default effort, and the app's new-thread picker shows only the levels the model has locally.
 pub fn pi_reasoning_accepted(level: &str) -> bool {
     level == "max" || PI_REASONING_LEVELS.contains(&level)
 }

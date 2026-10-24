@@ -627,7 +627,7 @@ def read_only(data):
     return ['/usr/bin/sandbox-exec', *(arg for key, path in params.items() for arg in ('-D', f'{key}={path}')), '-p', READ_ONLY]
 ASK = '''on run argv
 activate
-display dialog (item 1 of argv) with title "Cloudroom" buttons {"Allow", "Allow for this thread", "Deny"} default button "Deny" cancel button "Deny" with icon caution giving up after 300
+display dialog (item 1 of argv) with title "Cloudroom" buttons {"Allow", "Allow for this sandbox", "Deny"} default button "Deny" cancel button "Deny" with icon caution giving up after 300
 return button returned of result
 end run'''
 
@@ -713,8 +713,9 @@ class MacJobs:
         self.folder, self.running, self.lock = folder, {}, threading.Lock()
         # Jobs the agent stopped before they started; execute skips them.
         self.cancelled = set()
-        # Ask first: one dialog at a time; "Allow for this thread" trusts that sandbox's core until the helper restarts.
-        self.asking, self.trusted = threading.Lock(), set()
+        # Ask first: one dialog at a time. "Allow for this sandbox" trusts every agent on that sandbox's core (jobs carry no
+        # thread), until the helper restarts or the access level changes.
+        self.asking, self.trusted, self.level = threading.Lock(), set(), None
 
     def enabled(self):
         config = private_json(self.folder / 'config.json')
@@ -749,13 +750,19 @@ class MacJobs:
             answer = process.communicate()[0].strip()
             with self.lock:
                 self.running.pop(job['id'], None)
-            if answer == 'Allow for this thread':
+            if answer == 'Allow for this sandbox':
                 self.trusted.add(core.key)
-            return answer in ('Allow', 'Allow for this thread')
+            return answer in ('Allow', 'Allow for this sandbox')
+
+    def track(self, level):
+        """Any access level change, even Off and back, ends "Allow for this sandbox"."""
+        if level != self.level:
+            self.trusted, self.level = set(), level
 
     def refusal(self, core, job):
         """Why this job may not run as asked, or None. Everything else that is not full access runs read-only."""
         level = mac_level(self.enabled() or {})
+        self.track(level)
         if level == 'off':
             return 'Mac access is off.'
         if level == 'full' or not job.get('write') and sys.platform == 'darwin' and level in ('read-only', 'ask'):
@@ -774,6 +781,7 @@ class MacJobs:
         while True:
             with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
                 config = self.enabled()
+                self.track(mac_level(config or {}))
                 listed = {core.key: core for core in cores(config)} if config else {}
                 self.wanted = set(listed)
                 for key, core in listed.items():
