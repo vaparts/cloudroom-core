@@ -32,7 +32,7 @@ type Values = BTreeMap<String, String>;
 struct Pending {
     session: String,
     names: Vec<String>,
-    reply: oneshot::Sender<Option<Values>>,
+    reply: oneshot::Sender<Answer>,
 }
 #[derive(Default)]
 pub struct Secrets {
@@ -49,11 +49,12 @@ pub struct Request {
     purpose: Option<String>,
     path: String,
 }
-/// The app's answer. No values means the user cancelled.
+/// The app's answer. No values means the request was cancelled, and `reason` says why.
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Answer {
     values: Option<Values>,
+    reason: Option<String>,
 }
 
 pub struct Failure(StatusCode, String);
@@ -193,11 +194,25 @@ async fn ask(
         )
     })?;
     match answer.await {
-        Ok(Some(values)) => Ok(Json(json!({"values":values}))),
-        _ => Err(Failure(
-            StatusCode::CONFLICT,
-            "Secret request cancelled".into(),
-        )),
+        Ok(Answer {
+            values: Some(values),
+            ..
+        }) => Ok(Json(json!({"values":values}))),
+        answer => {
+            let reason: String = answer
+                .ok()
+                .and_then(|a| a.reason)
+                .unwrap_or_default()
+                .chars()
+                .filter(|c| !c.is_control())
+                .take(300)
+                .collect();
+            let message = match reason.trim() {
+                "" => "Secret request cancelled".into(),
+                reason => format!("Secret request cancelled ({reason})"),
+            };
+            Err(Failure(StatusCode::CONFLICT, message))
+        }
     }
 }
 
@@ -227,7 +242,7 @@ async fn answer(
             "Answer every requested variable with one non-empty line".into(),
         ));
     }
-    let _ = pending.remove(&id).unwrap().reply.send(input.values);
+    let _ = pending.remove(&id).unwrap().reply.send(input);
     Ok((StatusCode::ACCEPTED, Json(json!({"accepted":true}))))
 }
 

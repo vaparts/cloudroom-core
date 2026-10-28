@@ -1139,6 +1139,44 @@ fn plan_limited(harness: &str, resets: Option<u64>) -> Event {
     }
 }
 
+/// The plan limit is used up, but the harness keeps working on paid credits until `resets` (ms), if it said. The
+/// website holds the account's loops meanwhile (ADR 0292).
+fn plan_credits(harness: &str, resets: Option<u64>) -> Event {
+    Event::Record {
+        kind: "plan_credits",
+        data: serde_json::json!({"harness":harness,"resets_at_ms":resets}),
+        native: None,
+    }
+}
+
+/// Claude Code's login files (API key, then token), so a credits hold can tell its login changed (ADR 0292).
+pub(crate) fn claude_login(config: &Config) -> Vec<u8> {
+    let mut bytes = std::fs::read(claude::key_path(config)).unwrap_or_default();
+    bytes.extend(std::fs::read(claude::token_path(config)).unwrap_or_default());
+    bytes
+}
+
+/// The harness shows its plan in use again, with no extra credits: any credits hold on it can end (ADR 0292).
+fn plan_ok(harness: &str) -> Event {
+    Event::Record {
+        kind: "plan_ok",
+        data: serde_json::json!({"harness":harness}),
+        native: None,
+    }
+}
+
+/// A credits signal with an unknown reset is sent again this often, so the website's one-hour hold stays renewed
+/// without a report on every event.
+pub(crate) const CREDITS_RESEND: std::time::Duration = std::time::Duration::from_secs(20 * 60);
+
+/// Whether a credits signal goes out: a new reset, or an unknown one not sent for `CREDITS_RESEND`.
+fn credits_due(last: &Option<(Option<u64>, std::time::Instant)>, resets: Option<u64>) -> bool {
+    match last {
+        Some((sent, at)) => *sent != resets || (resets.is_none() && at.elapsed() >= CREDITS_RESEND),
+        None => true,
+    }
+}
+
 /// The error a plan-limited turn shows, then the provider's own words.
 fn plan_limit_error(provider: &str, resets: Option<u64>, said: &str) -> String {
     let when = match resets {

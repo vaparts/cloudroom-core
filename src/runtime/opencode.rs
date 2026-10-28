@@ -89,7 +89,7 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     if requested != "default" && cursor::option_value(&session, "model") != Some(requested) {
         if !choices(&session, "model").contains(&requested) {
             return Err(invalid(format!(
-                "OpenCode model {requested} is unavailable in Cloud. Sign in to its provider with `opencode auth login` on your Mac, and Cloudroom copies that login to Cloud. Provider keys set only as shell variables are not copied; add them in Settings → Cloud environment."
+                "OpenCode model {requested} is unavailable in Cloud. On your Mac, sign in to its provider with `opencode auth login`, or add the provider to ~/.config/opencode/opencode.json; Cloudroom copies both to Cloud. A provider on your Mac's localhost can't be reached from Cloud. Provider keys set only as shell variables are not copied; add them in Settings → Cloud environment."
             )));
         }
         session = set(handle, &id, "model", requested).await?;

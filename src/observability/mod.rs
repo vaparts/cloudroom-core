@@ -333,13 +333,19 @@ impl Observability {
                     {
                         continue;
                     }
+                    // The Mac helper pairs and reports to each awake sandbox every 2 s: like GETs, only counts upload.
                     if let Signal::Api {
                         method,
                         route,
                         status,
                         duration_ms,
                     } = &record.signal
-                        && (*method == "GET" || (*method == "POST" && route == "/v1/sync"))
+                        && (*method == "GET"
+                            || (*method == "POST"
+                                && matches!(
+                                    route.as_str(),
+                                    "/v1/sync" | "/v1/previews/device" | "/v1/previews/report"
+                                )))
                         && (200..400).contains(status)
                         && *duration_ms < SLOW_API_MS
                     {

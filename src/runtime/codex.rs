@@ -339,6 +339,13 @@ pub(super) struct Protocol {
     bucket: String,
     // The running turn hit the plan limit.
     limited: bool,
+    // The last credits signal sent (its reset, and when), so a reset is reported once and an unknown one rarely.
+    credits: Option<(Option<u64>, std::time::Instant)>,
+    // Whether this process reported its plan fine since its last credits signal.
+    plan_ok_sent: bool,
+    // The latest known credits (an update with `credits: null` keeps them) and whether Codex said a limit was reached.
+    paid: bool,
+    reached: std::collections::BTreeSet<String>,
 }
 impl Protocol {
     pub fn new(
@@ -359,13 +366,43 @@ impl Protocol {
             windows: HashMap::new(),
             bucket: "codex".into(),
             limited: false,
+            credits: None,
+            plan_ok_sent: false,
+            paid: false,
+            reached: Default::default(),
         }
+    }
+
+    /// The global bucket's and the active one's windows at their limit: a weekly window outlasts the 5-hour one, and
+    /// another model's bucket does not apply.
+    fn exhausted(&self) -> impl Iterator<Item = &Value> + '_ {
+        ["codex", self.bucket.as_str()]
+            .into_iter()
+            .filter_map(|b| self.windows.get(b))
+            .flatten()
+            .filter(|w| w["usedPercent"].as_f64().is_some_and(|p| p >= 100.0))
+            // A window seen used up earlier in a long-lived process no longer counts once it reset.
+            .filter(|w| {
+                w["resetsAt"]
+                    .as_u64()
+                    .is_none_or(|at| at * 1000 > crate::observability::now_ms())
+            })
+    }
+
+    /// When the latest of those windows resets (ms).
+    fn resets(&self) -> Option<u64> {
+        self.exhausted()
+            .filter_map(|w| w["resetsAt"].as_u64())
+            .max()
+            .map(|s| s * 1000)
     }
 }
 impl Adapter for Protocol {
     fn encode(&mut self, id: u64, method: &str, params: Value, request: Option<&str>) -> Value {
         if request.is_some() {
             self.prompt_id = Some(id);
+            // Each turn hears about credits again, so a guarded turn is stopped even if an earlier one saw them.
+            self.credits = None;
         }
         // A side chat's first fork is its start; only a rewind replaces a known thread.
         if method == "thread/fork" && self.root.is_some() {
@@ -518,6 +555,37 @@ impl Adapter for Protocol {
                     *slot = limits[key].clone();
                 }
             }
+            // Over the plan limit with purchased (or unlimited) credits: Codex keeps working and spends them. Real
+            // Codex sends null windows at its limit, so a reached limit counts too, and credits seen earlier stay.
+            let credits = &limits["credits"];
+            if !credits.is_null() {
+                self.paid = credits["hasCredits"] == true || credits["unlimited"] == true;
+            }
+            // Per bucket: a model's bucket (say `premium`) reaching its limit never sticks to the account-wide one.
+            let present = ["primary", "secondary"]
+                .iter()
+                .any(|key| !limits[*key].is_null());
+            if !limits["rateLimitReachedType"].is_null() {
+                self.reached.insert(self.bucket.clone());
+            } else if present {
+                self.reached.remove(&self.bucket);
+            }
+            let reached = self.reached.contains("codex") || self.reached.contains(&self.bucket);
+            let healthy =
+                self.bucket == "codex" && present && !reached && self.exhausted().next().is_none();
+            if self.paid
+                && (reached || self.exhausted().next().is_some())
+                && super::credits_due(&self.credits, self.resets())
+            {
+                self.credits = Some((self.resets(), std::time::Instant::now()));
+                self.plan_ok_sent = false;
+                events.push(super::plan_credits("codex", self.resets()));
+            } else if healthy && !self.plan_ok_sent {
+                // Only the account-wide bucket says the plan is in use again; a model's bucket may differ.
+                self.credits = None;
+                self.plan_ok_sent = true;
+                events.push(super::plan_ok("codex"));
+            }
         }
         let limited = Some(&json!("usageLimitExceeded"));
         if root
@@ -525,6 +593,8 @@ impl Adapter for Protocol {
                 || params.pointer("/error/codexErrorInfo") == limited)
         {
             self.limited = true;
+            // The plan coming back after this limit is news again.
+            self.plan_ok_sent = false;
         }
         match if root { method } else { "" } {
             "turn/started" => {
@@ -569,17 +639,10 @@ impl Adapter for Protocol {
                     .pointer("/turn/error/message")
                     .and_then(Value::as_str)
                     .map(str::to_owned);
+                // The next turn, prompted or Codex's own, hears about credits again.
+                self.credits = None;
                 if std::mem::take(&mut self.limited) {
-                    // The latest exhausted window of the global bucket and the active one: a weekly window
-                    // outlasts the 5-hour one, and another model's bucket does not apply.
-                    let resets = ["codex", self.bucket.as_str()]
-                        .iter()
-                        .filter_map(|b| self.windows.get(*b))
-                        .flatten()
-                        .filter(|w| w["usedPercent"].as_f64().is_some_and(|p| p >= 100.0))
-                        .filter_map(|w| w["resetsAt"].as_u64())
-                        .max()
-                        .map(|s| s * 1000);
+                    let resets = self.resets();
                     events.push(super::plan_limited("codex", resets));
                     let said = error.as_deref().unwrap_or("usage limit reached");
                     error = Some(super::plan_limit_error("Codex", resets, said));

@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Retire a managed VM's administrator-owned Codex/Pi setup without touching core logins."""
 import argparse
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -79,29 +80,44 @@ def shell_agents(uid):
     return found
 
 
+@contextlib.contextmanager
+def as_agent(agent):
+    """Write in the agent's home as the agent. Root's chown would follow a symlink the agent swaps in mid-copy."""
+    euid, egid, groups = os.geteuid(), os.getegid(), os.getgroups()
+    os.setgroups([agent.pw_gid])
+    os.setegid(agent.pw_gid)
+    os.seteuid(agent.pw_uid)
+    try:
+        yield
+    finally:
+        os.seteuid(euid)
+        os.setegid(egid)
+        os.setgroups(groups)
+
+
 def copy_missing(source, destination, agent, report):
     if source.is_symlink():
         report['preserved_symlinks'] += 1
     elif source.is_dir():
-        if destination.exists() and not destination.is_dir() or destination.is_symlink():
-            report['conflicts'] += 1
-            return
-        destination.mkdir(mode=0o700, parents=True, exist_ok=True)
-        os.chown(destination, agent.pw_uid, agent.pw_gid)
+        with as_agent(agent):
+            if destination.exists() and not destination.is_dir() or destination.is_symlink():
+                report['conflicts'] += 1
+                return
+            destination.mkdir(mode=0o700, parents=True, exist_ok=True)
         for child in source.iterdir():
             copy_missing(child, destination / child.name, agent, report)
     elif source.is_file():
-        if destination.exists() or destination.is_symlink():
-            if destination.is_symlink() or not destination.is_file() or source.read_bytes() != destination.read_bytes():
-                report['conflicts'] += 1
-            return
-        real_path(destination)
-        destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-        # Exclusive creation never replaces settings written concurrently by an agent.
-        with destination.open('xb') as output, source.open('rb') as input_file:
-            shutil.copyfileobj(input_file, output)
-        destination.chmod(0o600)
-        os.chown(destination, agent.pw_uid, agent.pw_gid)
+        content = source.read_bytes()
+        with as_agent(agent):
+            if destination.exists() or destination.is_symlink():
+                if destination.is_symlink() or not destination.is_file() or content != destination.read_bytes():
+                    report['conflicts'] += 1
+                return
+            real_path(destination)
+            destination.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            # Exclusive creation never replaces settings written concurrently by an agent.
+            with os.fdopen(os.open(destination, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600), 'wb') as output:
+                output.write(content)
         report['copied_settings'] += 1
 
 
@@ -142,11 +158,11 @@ def retire(shell, agent, archive_root, apply=False):
         if (path.exists() or path.is_symlink()) and not (saved.exists() or saved.is_symlink()):
             archive_move(path, saved)
         atomic_file(path, BLOCKED.encode(), 0o755)
-    for relative in ('.codex', '.pi', '.pi/agent'):
-        path = target / relative
-        if not path.exists():
-            path.mkdir(mode=0o700)
-            os.chown(path, agent.pw_uid, agent.pw_gid)
+    with as_agent(agent):
+        for relative in ('.codex', '.pi', '.pi/agent'):
+            path = target / relative
+            if not path.exists():
+                path.mkdir(mode=0o700)
     for relative in SETTINGS:
         copy_missing(home / relative, target / relative, agent, report)
     if shell_agents(shell.pw_uid):

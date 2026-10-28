@@ -95,11 +95,12 @@ def api(values, path):
             time.sleep(3)
 
 
-def sessions(values):
+def sessions(values, ids=None):
+    """The dashboard, and details of the sessions in `ids` or, by default, the dashboard's list.
+    It lists the 1,000 most recently active sessions; Core never removes old ones, so older VMs have more."""
     dashboard = api(values, '/v1/dashboard')
-    if dashboard['sessionCount'] != len(dashboard['sessions']):
-        raise RuntimeError('Too many sessions to check')
-    return dashboard, {s['id']: api(values, '/v1/sessions/' + s['id'])['session'] for s in dashboard['sessions']}
+    ids = [s['id'] for s in dashboard['sessions']] if ids is None else ids
+    return dashboard, {sid: api(values, '/v1/sessions/' + sid)['session'] for sid in ids}
 
 
 def busy(values):
@@ -107,6 +108,9 @@ def busy(values):
     dashboard, details = sessions(values)
     if not dashboard['runtime']['ready']:
         return 'local runtime is not ready'
+    agents = dashboard.get('agents') or {}  # Counts every session, including those past the list.
+    if agents.get('working') or agents.get('queued'):
+        return 'agents are working'
     recent = max((s.get('lastActivity') or 0 for s in dashboard['sessions']), default=0)
     if time.time() * 1000 - recent < QUIET_MS:
         return 'recent session activity'
@@ -251,7 +255,8 @@ def verify(values, before, expected, features, baseline, deadline=300):
     stop = time.monotonic() + deadline
     while True:
         try:
-            dashboard, after = sessions(values)
+            # The same sessions by ID, since a restart can reorder which 1,000 the dashboard lists. A lost one fails its lookup.
+            dashboard, after = sessions(values, before)
             capabilities = api(values, '/v1/capabilities')
             pid = run('systemctl', 'show', 'cloudroom.service', '-p', 'MainPID', '--value')
             running = sha(f'/proc/{pid}/exe')
@@ -265,7 +270,6 @@ def verify(values, before, expected, features, baseline, deadline=300):
         failures = [name for name, ok in {
             'running binary': running == expected,
             'features': all(capabilities.get(f) is True for f in features),
-            'session set': set(after) == set(before),
         }.items() if not ok]
         waiting = not dashboard['runtime']['ready']
         for sid in before.keys() & after.keys():

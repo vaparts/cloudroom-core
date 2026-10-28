@@ -40,8 +40,8 @@ const LIMIT: usize = 16 * 1024 * 1024;
 const BODY: usize = 5 * LIMIT;
 /// A connected helper must confirm each job quickly; a sleeping Mac must not hang agents.
 const ACK: Duration = Duration::from_secs(10);
-/// A job's stdin reaches the Mac before its helper can confirm it, so big inputs (`push`) get extra time at this
-/// many hex bytes per second, a slow link's speed (feedback #386).
+/// Older helpers get a job's stdin inside the job event, before they can confirm it, so big inputs (`push`) get extra
+/// time at this many hex bytes per second, a slow link's speed (feedback #386). Newer helpers download it after (#576).
 const SLOW_LINK: usize = 32 * 1024;
 const KEEP: Duration = Duration::from_secs(3600);
 /// The helper needs a few seconds to find a new thread's sandbox or reconnect after a wake, so early calls wait for it.
@@ -51,6 +51,8 @@ const UNAVAILABLE: &str = "Mac unavailable: the paired Mac is offline, asleep, o
 const NOT_RESPONDING: &str = "Mac not responding: the paired Mac is connected but did not pick up this command in time. It may be asleep, very busy, or on a slow connection. Continue cloud work and try again later.";
 /// For `mac status`, which sends no command: the helper is connected, but the last command went unanswered.
 const STALE: &str = "Mac not responding: the paired Mac is connected but did not pick up the last command in time. It may be asleep, very busy, or on a slow connection. Continue cloud work and try again later.";
+/// The Mac's helper process restarted while running this command, so its result never arrives (#569).
+const LOST: &str = "The Mac app restarted while this command was running, so its output is lost. It may have finished: check its effects before running it again.";
 /// The helper connection changed while this command waited for it to confirm the command.
 const RECONNECTED: &str = "Mac unavailable: the connection to the Mac restarted while this command was starting. Run it again.";
 /// The Mac app resends its report every minute, so an older one may describe a Mac that has since slept.
@@ -88,6 +90,11 @@ pub struct Report {
 #[derive(Deserialize)]
 pub struct Device {
     device: String,
+    /// New each time the helper process starts. Older helpers send none (#569).
+    boot: Option<String>,
+    /// The helper downloads each job's stdin after confirming it, so a big push never holds up other jobs (#576).
+    #[serde(default)]
+    fetch: bool,
 }
 /// What the user's Mac app sees of Mac access (#109). The app reaches this sandbox even when the Mac's helper can't,
 /// so agents learn why the Mac is unavailable. `problem` is the short reason Settings shows, never technical detail.
@@ -99,15 +106,21 @@ pub struct AppReport {
 
 struct Job {
     device: String,
+    /// The helper process that took the job; its replacement marks the job lost.
+    boot: Option<String>,
     acked: bool,
     result: Option<Value>,
     at: Instant,
     /// Hex output received in parts so far: stdout, stderr.
     parts: [Vec<u8>; 2],
+    /// Raw stdin a fetching helper downloads after confirming; freed with the result.
+    stdin: Bytes,
 }
 struct Helper {
     generation: u64,
     device: String,
+    boot: Option<String>,
+    fetch: bool,
     events: mpsc::Sender<std::result::Result<Event, Infallible>>,
     /// A job went unanswered: the Mac likely slept while a proxy kept its stream open.
     stale: bool,
@@ -140,6 +153,22 @@ impl Mac {
     /// A new thread or a dropped helper reopens the short wait for the Mac.
     pub(crate) fn expect(&self) {
         *self.since.lock().unwrap() = Instant::now();
+    }
+    /// A restarted helper can't report jobs its old process was running, so end them instead of leaving them
+    /// "running" for a day (#569). A plain reconnect keeps its boot and still reports its own results.
+    fn end_lost(&self, device: &str, boot: Option<&str>) {
+        let Some(boot) = boot else { return };
+        for job in self.jobs.lock().unwrap().values_mut() {
+            if job.device == device
+                && job.acked
+                && job.result.is_none()
+                && job.boot.as_deref().is_some_and(|old| old != boot)
+            {
+                job.result = Some(json!({"state":"lost","message":LOST}));
+                job.stdin = Bytes::new();
+                job.at = Instant::now();
+            }
+        }
     }
     fn touch(&self) {
         self.changed.send_modify(|n| *n += 1);
@@ -255,6 +284,7 @@ pub fn routes() -> Router<Arc<Manager>> {
             "/v1/mac/results/{id}",
             post(report).layer(DefaultBodyLimit::max(BODY)),
         )
+        .route("/v1/mac/jobs/{id}/stdin", get(job_stdin))
         .route(
             "/v1/vm/run",
             post(vm_run).layer(DefaultBodyLimit::max(BODY)),
@@ -290,9 +320,12 @@ async fn stream(
     }
     let (events, receiver) = mpsc::channel(64);
     let generation = m.mac.next.fetch_add(1, Ordering::Relaxed);
+    m.mac.end_lost(&input.device, input.boot.as_deref());
     *m.mac.helper.lock().unwrap() = Some(Helper {
         generation,
         device: input.device,
+        boot: input.boot,
+        fetch: input.fetch,
         events: events.clone(),
         stale: false,
     });
@@ -365,6 +398,7 @@ async fn report(
             }
             job.acked = true;
             job.at = Instant::now();
+            job.stdin = Bytes::new();
             job.result = Some(json!({"state":"done","code":input.code,"stdout":stdout,
                 "stderr":stderr,"truncated":input.truncated}));
         }
@@ -373,6 +407,22 @@ async fn report(
     drop(jobs);
     m.mac.touch();
     Ok(Json(json!({"accepted":true})))
+}
+
+/// A fetching helper downloads a confirmed job's raw stdin here.
+async fn job_stdin(
+    State(m): State<Arc<Manager>>,
+    RoutePath(id): RoutePath<String>,
+    Query(input): Query<Device>,
+) -> Result<Bytes> {
+    let jobs = m.mac.jobs.lock().unwrap();
+    jobs.get(&id)
+        .filter(|j| j.device == input.device && j.acked && j.result.is_none())
+        .map(|j| j.stdin.clone())
+        .ok_or(Failure(
+            StatusCode::NOT_FOUND,
+            "Unknown or expired Mac job".into(),
+        ))
 }
 
 fn local_auth(m: &Manager, peer: Peer) -> Result<()> {
@@ -391,14 +441,20 @@ async fn local_run(
     Json(run): Json<Run>,
 ) -> Result<Json<Value>> {
     local_auth(&m, peer)?;
-    validate(&run)?;
+    let stdin = validate(&run)?;
     let mac = &m.mac;
     let mut changed = mac.changed.subscribe();
     let fresh = mac.since.lock().unwrap().elapsed() < FRESH;
     let wait = Instant::now() + if fresh { ATTACH } else { Duration::ZERO };
-    let (generation, device, events) = loop {
+    let (generation, device, boot, fetch, events) = loop {
         if let Some(h) = mac.helper.lock().unwrap().as_ref() {
-            break (h.generation, h.device.clone(), h.events.clone());
+            break (
+                h.generation,
+                h.device.clone(),
+                h.boot.clone(),
+                h.fetch,
+                h.events.clone(),
+            );
         }
         if Instant::now() >= wait {
             return Err(Failure(StatusCode::CONFLICT, mac.unavailable()));
@@ -420,16 +476,22 @@ async fn local_run(
             id.clone(),
             Job {
                 device,
+                boot,
                 acked: false,
                 result: None,
                 at: Instant::now(),
                 parts: Default::default(),
+                stdin: if fetch { stdin.into() } else { Bytes::new() },
             },
         );
     }
-    let data =
-        json!({"id":id,"command":run.command,"stdin":run.stdin,"cwd":run.cwd,"write":run.write})
-            .to_string();
+    let mut data = json!({"id":id,"command":run.command,"cwd":run.cwd,"write":run.write});
+    if fetch {
+        data["stdin_bytes"] = json!(run.stdin.len() / 2);
+    } else {
+        data["stdin"] = json!(run.stdin);
+    }
+    let data = data.to_string();
     if events
         .send(Ok(Event::default().event("job").data(data)))
         .await
@@ -443,7 +505,12 @@ async fn local_run(
         events,
         armed: true,
     };
-    let deadline = Instant::now() + ACK + Duration::from_secs((run.stdin.len() / SLOW_LINK) as u64);
+    let slow = if fetch {
+        0
+    } else {
+        run.stdin.len() / SLOW_LINK
+    };
+    let deadline = Instant::now() + ACK + Duration::from_secs(slow as u64);
     loop {
         let connected = mac.connected(generation);
         {
@@ -669,7 +736,12 @@ fn quote(path: &str) -> String {
     if rest.is_empty() {
         return prefix.to_owned();
     }
-    format!("{prefix}'{}'", rest.replace('\'', "'\\''"))
+    format!("{prefix}{}", literal(rest))
+}
+
+/// Quotes `text` for the shell exactly as written, `~` included.
+fn literal(text: &str) -> String {
+    format!("'{}'", text.replace('\'', "'\\''"))
 }
 
 pub(crate) async fn request(
@@ -733,13 +805,15 @@ pub async fn cli(args: &[String]) -> io::Result<i32> {
         args.remove(0);
     }
     let usage = "room-cli mac run [--cwd DIR] [--stdin] [--write] COMMAND
-room-cli mac pull MAC_PATH [VM_FOLDER]
-room-cli mac push VM_PATH [MAC_FOLDER]
+room-cli mac pull MAC_PATH [VM_PATH]
+room-cli mac push VM_PATH [MAC_PATH]
 room-cli mac result JOB
 room-cli mac status
 Runs on the user's paired Mac as the user, in their home folder by default.
 Add --write when a command changes the Mac. Unless the user gives Full access,
-other commands run read-only, and --write needs their approval.";
+other commands run read-only, and --write needs their approval.
+pull and push work like cp: into an existing folder or a path ending in /,
+else under that new name, which must not exist yet.";
     let name = args.first().cloned().unwrap_or_default();
     match (name.as_str(), &args[1.min(args.len())..]) {
         ("run", rest) => {
@@ -747,6 +821,11 @@ other commands run read-only, and --write needs their approval.";
             let mut rest = rest.iter();
             while let Some(word) = rest.next() {
                 match word.as_str() {
+                    // After the command words, `--help` belongs to the command: `mac run ls --help`.
+                    "--help" | "-h" if words.is_empty() => {
+                        println!("{usage}");
+                        return Ok(0);
+                    }
                     "--cwd" if words.is_empty() => cwd = rest.next().cloned(),
                     "--stdin" if words.is_empty() => stdin = true,
                     "--write" if words.is_empty() => write = true,
@@ -765,6 +844,10 @@ other commands run read-only, and --write needs their approval.";
             let value = request(&socket, "POST", "/jobs", Some(body)).await?;
             print_result(value).await
         }
+        (_, rest) if rest.iter().any(|w| matches!(w.as_str(), "--help" | "-h")) => {
+            println!("{usage}");
+            Ok(0)
+        }
         ("result", [job]) if job.bytes().all(|b| b.is_ascii_digit() || b == b'-') => {
             print_result(request(&socket, "GET", &format!("/jobs/{job}"), None).await?).await
         }
@@ -780,7 +863,7 @@ other commands run read-only, and --write needs their approval.";
         }
         _ => {
             println!("{usage}");
-            Ok(if name.is_empty() || name == "--help" {
+            Ok(if matches!(name.as_str(), "" | "--help" | "-h") {
                 0
             } else {
                 2
@@ -796,4 +879,34 @@ async fn print_result(value: Value) -> io::Result<i32> {
     std::io::stdout().flush()?;
     std::io::stderr().write_all(&stderr)?;
     Ok(code.unwrap_or(1))
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn subcommand_help_prints_usage_but_run_passes_it_after_the_command() {
+        let cli = |words: &str| {
+            let args = format!("--socket /nonexistent/mac.sock {words}");
+            async move { super::cli(&args.split(' ').map(String::from).collect::<Vec<_>>()).await }
+        };
+        for words in [
+            "-h",
+            "run --help",
+            "run --write -h",
+            "pull --help",
+            "push -h",
+            "push x --help",
+            "status --help",
+            "result -h",
+        ] {
+            assert_eq!(cli(words).await.unwrap(), 0, "{words}");
+        }
+        // The missing socket proves it went to the Mac.
+        let error = cli("run ls --help").await.unwrap_err().to_string();
+        assert!(error.contains("not installed"), "{error}");
+        let error = cli("push /nonexistent/x").await.unwrap_err().to_string();
+        assert!(error.starts_with("VM path /nonexistent/x: "), "{error}");
+        let error = cli("push Cargo.toml/").await.unwrap_err().to_string();
+        assert!(error.contains("not installed"), "{error}");
+    }
 }

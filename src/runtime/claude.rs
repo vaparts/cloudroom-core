@@ -43,14 +43,17 @@ pub(super) fn command(
         Some(saved) => saved.id.clone(),
         None => uuid()?,
     };
+    // Claude keeps only the last `--settings`, so every setting goes in one, the Command Guard's hooks included.
+    let mut settings = json!({"fastMode": false, "enableWorkflows": false});
+    if strip_ai_co_authors {
+        settings["attribution"] = json!({"commit": "", "pr": ""});
+    }
+    let settings = settings.to_string();
     let mut command = if guarded {
-        super::command_guard::claude_command(config, profile)
+        super::command_guard::claude_command(config, profile, &settings)
     } else {
         let mut command = super::command(&profile.binary, config);
-        command.args([
-            "--settings",
-            r#"{"fastMode":false,"enableWorkflows":false}"#,
-        ]);
+        command.args(["--settings", &settings]);
         command
     };
     profile_env(&mut command, config, profile);
@@ -85,9 +88,6 @@ pub(super) fn command(
             "--mcp-config",
             r#"{"mcpServers":{"cloudroom":{"type":"sdk","name":"cloudroom"}}}"#,
         ]);
-    if strip_ai_co_authors {
-        command.args(["--settings", r#"{"attribution":{"commit":"","pr":""}}"#]);
-    }
     if let Some(saved) = saved {
         command.arg("--resume").arg(&saved.id);
         if let Some(before) = fork {
@@ -586,8 +586,17 @@ pub(super) struct Protocol {
     bootstrapped: bool,
     close_confirmed: bool,
     last_result_failed: bool,
-    // Claude's plan limit rejected this turn: when it resets, if Claude said (ms).
-    limit: Option<Option<u64>>,
+    // Claude's plan limit rejected this turn: when it resets, if Claude said (ms), and whether it is the account's
+    // (not one model's own window).
+    limit: Option<(Option<u64>, bool)>,
+    // The last credits signal sent (its reset, and when), so a reset is reported once and an unknown one rarely.
+    credits: Option<(Option<u64>, std::time::Instant)>,
+    // Claude's latest word on the account: on credits until this reset. Claude Code sends its limits only when they
+    // change (2.1.304), so each turn hears that word again (`recheck`).
+    overage: Option<Option<u64>>,
+    recheck: bool,
+    // Whether this process reported its plan fine since its last credits signal.
+    plan_ok_sent: bool,
     message_id: String,
     blocks: HashMap<u64, Value>,
     streamed: HashSet<String>,
@@ -621,6 +630,10 @@ impl Protocol {
             close_confirmed: false,
             last_result_failed: false,
             limit: None,
+            credits: None,
+            overage: None,
+            recheck: false,
+            plan_ok_sent: false,
             message_id: String::new(),
             blocks: HashMap::new(),
             streamed: HashSet::new(),
@@ -730,6 +743,8 @@ impl Adapter for Protocol {
             );
             if let Some(request) = request {
                 self.active = Some((wire.clone(), request.into()));
+                // Each turn hears about credits again, so a guarded turn is stopped even if an earlier one saw them.
+                self.recheck = true;
                 self.interrupting = false;
                 self.blocks.clear();
                 self.streamed.clear();
@@ -776,6 +791,18 @@ impl Adapter for Protocol {
         self.pending_frames.clear();
         let mut events = vec![];
         let kind = value["type"].as_str().unwrap_or("");
+        // Not on a control message, whose replies may drop these events: the next message carries them.
+        if !kind.starts_with("control_") && std::mem::take(&mut self.recheck) {
+            match self.overage {
+                Some(Some(at)) if at <= crate::observability::now_ms() => self.overage = None,
+                Some(resets) => {
+                    self.credits = Some((resets, std::time::Instant::now()));
+                    self.plan_ok_sent = false;
+                    events.push(super::plan_credits("claude-code", resets));
+                }
+                None => {}
+            }
+        }
         if kind == "control_request" {
             if value["request"]["subtype"] == "mcp_message"
                 && value["request"]["server_name"] == "cloudroom"
@@ -1063,17 +1090,73 @@ impl Adapter for Protocol {
             }
         }
         // A hard rejection, as the app's Local Claude reads it: over the plan limit, with no overage to fall back on.
+        // Only an account-wide window (`five_hour`, `seven_day`, `overage`, or none named) is the account's plan; a
+        // model's own window (say a weekly Opus one) is not.
         let info = &value["rate_limit_info"];
-        if kind == "rate_limit_event"
-            && info["status"] == "rejected"
-            && !matches!(
-                info["overageStatus"].as_str(),
-                Some("allowed" | "allowed_warning")
-            )
+        let overage = matches!(
+            info["overageStatus"].as_str(),
+            Some("allowed" | "allowed_warning")
+        );
+        let account_wide = info["rateLimitType"]
+            .as_str()
+            .is_none_or(|kind| matches!(kind, "five_hour" | "seven_day" | "overage"));
+        if kind == "rate_limit_event" && info["status"] == "rejected" && !overage {
+            self.limit = Some((info["resetsAt"].as_u64().map(|s| s * 1000), account_wide));
+            // The plan coming back after this limit is news again.
+            self.overage = None;
+            self.plan_ok_sent = false;
+        }
+        // Over the plan limit with extra usage on: Claude keeps working and bills the account's credits. Claude Code
+        // 2.1.303 sends `isUsingOverage`, `overageStatus` and `unifiedWindows`, but the SDK docs list none of them.
+        // `isUsingOverage`, when sent, decides. Without it, an account-wide window counts: rejected with overage
+        // allowed, or the documented `utilization` at 1 (the plan used up) on an allowed request.
+        let using = info["isUsingOverage"].as_bool();
+        let on_credits = match using {
+            Some(using) => using,
+            None => {
+                account_wide
+                    && ((info["status"] == "rejected" && overage)
+                        || (info["status"] != "rejected"
+                            && info["utilization"].as_f64().is_some_and(|u| u >= 1.0)))
+            }
+        };
+        if kind == "rate_limit_event" && on_credits {
+            // The plan comes back when its latest used-up account-wide window resets; else at the event's own reset,
+            // unless that is the credits' own (an `overage` window).
+            let resets = ["five_hour", "seven_day"]
+                .iter()
+                .map(|key| &info["unifiedWindows"][*key])
+                .filter(|w| w["utilization"].as_f64().is_some_and(|u| u >= 1.0))
+                .filter_map(|w| w["resetsAt"].as_u64())
+                .max()
+                .or_else(|| {
+                    (info["rateLimitType"] != "overage")
+                        .then(|| info["resetsAt"].as_u64())
+                        .flatten()
+                })
+                .map(|s| s * 1000);
+            self.overage = Some(resets);
+            if super::credits_due(&self.credits, resets) {
+                self.credits = Some((resets, std::time::Instant::now()));
+                self.plan_ok_sent = false;
+                events.push(super::plan_credits("claude-code", resets));
+            }
+        } else if kind == "rate_limit_event"
+            && using == Some(false)
+            && account_wide
+            && info["status"] != "rejected"
         {
-            self.limit = Some(info["resetsAt"].as_u64().map(|s| s * 1000));
+            // The account is back on its plan (a reset, a switch, an upgrade): said once per process or after credits.
+            self.overage = None;
+            if !self.plan_ok_sent {
+                self.credits = None;
+                self.plan_ok_sent = true;
+                events.push(super::plan_ok("claude-code"));
+            }
         }
         if kind == "result" {
+            // The next turn, prompted or Claude's own, hears about credits again.
+            self.recheck = true;
             self.last_result_failed = value["is_error"] == true;
             let ids: HashSet<&str> = value["user_message_uuids"]
                 .as_array()
@@ -1134,8 +1217,16 @@ impl Adapter for Protocol {
                     events.push(Event::Authentication { accepted: true });
                 }
                 let mut error = (status == "failed").then(|| result_error(value));
-                if let (Some(resets), Some(text)) = (self.limit.take(), &mut error) {
-                    events.push(super::plan_limited("claude-code", resets));
+                if let (Some((resets, account_wide)), Some(text)) = (self.limit.take(), &mut error)
+                {
+                    let mut limited = super::plan_limited("claude-code", resets);
+                    if let Event::Record { data, .. } = &mut limited
+                        && !account_wide
+                    {
+                        // The thread still resumes at its reset; the account's other loops never wait for it.
+                        data["model_only"] = json!(true);
+                    }
+                    events.push(limited);
                     *text = super::plan_limit_error("Claude", resets, text);
                 }
                 events.extend(state.finished(status, error));

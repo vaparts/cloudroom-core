@@ -48,6 +48,10 @@ struct Derived {
     limit_resumes: u32,
     #[serde(default)]
     resume_refused: bool,
+    #[serde(default)]
+    resume_plan_only: bool,
+    #[serde(default)]
+    guarded_turn: bool,
 }
 
 impl Derived {
@@ -68,6 +72,8 @@ impl Derived {
             resume_loop: s.resume_loop.clone(),
             resume_spent: s.resume_spent.clone(),
             limit_episode: s.limit_episode,
+            resume_plan_only: s.resume_plan_only,
+            guarded_turn: s.guarded_turn,
             limit_resumes: s.limit_resumes,
             resume_refused: s.resume_refused,
         }
@@ -91,6 +97,8 @@ impl Derived {
         s.limit_episode = self.limit_episode;
         s.limit_resumes = self.limit_resumes;
         s.resume_refused = self.resume_refused;
+        s.resume_plan_only = self.resume_plan_only;
+        s.guarded_turn = self.guarded_turn;
     }
 }
 
@@ -389,6 +397,7 @@ impl Local {
                         session.recovery_attempted = false; // A new user request permits one recovery.
                         session.usage_limited = false;
                         session.usage_resets_ms = None;
+                        session.resume_plan_only = false;
                         // Only the resume loop's own prompt counts toward the cap, not a notice, switch, or user's.
                         if session.resume_loop.as_deref().is_some_and(|id| {
                             super::accounts::loop_request(id, &receipt.request_id)
@@ -496,6 +505,15 @@ impl Local {
             }
             "state" => {
                 session.state = record.data["state"].as_str().unwrap_or("unknown").into();
+                // A prompt's turn takes its `plan_only` guard; a turn the harness started itself keeps the one before.
+                if session.state == "starting_turn"
+                    && let Some(receipt) = record.data["request_id"]
+                        .as_str()
+                        .and_then(|request| session.receipts.get(request))
+                    && receipt.command != "auto"
+                {
+                    session.guarded_turn = receipt.input["plan_only"] == true;
+                }
                 session.failure =
                     matches!(session.state.as_str(), "failed" | "process_lost").then(|| {
                         let reason = record.data["reason"].as_str().unwrap_or("unknown cause");
@@ -529,6 +547,7 @@ impl Local {
                     // recorded after this prompt was accepted (queued behind it). Its loop retires now.
                     session.usage_limited = false;
                     session.usage_resets_ms = None;
+                    session.resume_plan_only = false;
                     session.resume_spent.extend(session.resume_loop.take());
                 }
             }
@@ -596,6 +615,7 @@ impl Local {
             }
             "usage_limited" => {
                 session.usage_limited = true;
+                session.resume_plan_only = record.data["plan_only"] == true;
                 session.usage_resets_ms = record.data["resets_at_ms"].as_u64();
                 session.resume_refused = false;
                 session.limit_episode += 1;

@@ -18,6 +18,8 @@ import time
 from urllib.parse import urlencode
 
 ROOT = Path(__file__).resolve().parents[1]
+# CI points this at the optimized build it ships (ADR 0296).
+BINARY = Path(os.environ.get('CLOUDROOM_BIN') or ROOT / 'target/debug/cloudroom')
 
 
 def fixture():
@@ -93,7 +95,7 @@ def main():
     # Test users cannot traverse the CI runner's private checkout. Keep executables
     # outside it and outside the deliberately small data filesystem.
     tools = base.with_name(unit + '-bin'); tools.mkdir(mode=0o755)
-    for source in (ROOT/'target/debug/cloudroom', Path(__file__), ROOT/'tests/pi_fixture.py'):
+    for source in (BINARY, Path(__file__), ROOT/'tests/pi_fixture.py'):
         target = tools/source.name; shutil.copyfile(source, target); target.chmod(0o755)
     for name in ('tmp', 'var-tmp'):
         (base / name).mkdir(); (base / name).chmod(0o1777)

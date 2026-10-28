@@ -241,24 +241,31 @@ impl Manager {
 
     /// Saves history in batches (ADR 0232): when the oldest unsaved record is 30 s old, 1,024 records wait, the
     /// agents go idle, or a drain or stop asks. Failures back off up to a minute; the journal keeps everything.
+    /// Going idle saves once: records written while idle (a chatty tool or watcher) wait the 30 s, or a thread
+    /// that writes every few seconds makes a file every few seconds (2026-10-23: ~1,000 files an hour). A new
+    /// prompt or command re-arms it, even one that finished between two checks.
     pub fn start_uploader(self: &Arc<Self>) {
         if !self.history.saves_externally() {
             return;
         }
         let manager = self.clone();
         tokio::spawn(async move {
-            let (mut since, mut failures, mut retry_at, mut faulted) =
-                (None::<Instant>, 0u32, Instant::now(), false);
+            let (mut since, mut failures, mut retry_at, mut faulted, mut settled) =
+                (None::<Instant>, 0u32, Instant::now(), false, false);
+            let mut commands = 0;
             loop {
                 let asked = tokio::select! {
                     _ = manager.uploads.notified() => true,
                     _ = tokio::time::sleep(Duration::from_secs(1)) => false,
                 };
-                let (pending, idle) = {
+                let (pending, idle, seen) = {
                     let local = manager.local.lock().unwrap();
                     let idle = local.sessions.values().all(|s| !s.busy());
-                    (local.journal.last() - local.journal.saved(), idle)
+                    let seen: usize = local.sessions.values().map(|s| s.receipts.len()).sum();
+                    (local.journal.last() - local.journal.saved(), idle, seen)
                 };
+                settled &= idle && seen == commands;
+                commands = seen;
                 if pending == 0 {
                     since = None;
                     continue;
@@ -267,7 +274,7 @@ impl Manager {
                 let due = asked
                     || pending >= UPLOAD_RECORDS
                     || waited >= UPLOAD_AFTER
-                    || (idle && waited >= Duration::from_secs(2));
+                    || (idle && !settled && waited >= Duration::from_secs(2));
                 if !due || (!asked && Instant::now() < retry_at) {
                     continue;
                 }
@@ -300,7 +307,7 @@ impl Manager {
                     }
                 };
                 match outcome {
-                    Ok(()) => (since, failures, faulted) = (None, 0, false),
+                    Ok(()) => (since, failures, faulted, settled) = (None, 0, false, idle),
                     Err(fault) => {
                         // Once per run of failures, not on every retry.
                         if let Some(operation) = fault.filter(|_| !faulted) {

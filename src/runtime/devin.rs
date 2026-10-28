@@ -68,22 +68,26 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
     }
     let mut options = session;
     let requested = handle.profile.model.as_str();
+    let mut effort = handle.reasoning.clone();
     if requested != "default" && cursor::option_value(&options, "model") != Some(requested) {
+        let offered = models(&options);
+        let (model, named) = match_model(&offered, requested);
+        effort = named.or(effort);
         options = handle
             .call(
                 "session/set_config_option",
-                json!({"sessionId":id,"configId":"model","value":requested}),
+                json!({"sessionId":id,"configId":"model","value":model}),
             )
             .await
             .map_err(|error| {
                 invalid(format!(
-                    "Devin model {requested} is unavailable for this account: {error}"
+                    "Devin in this Cloud sandbox refused model {requested}: {error}. It offers: {}",
+                    offered.join(", ")
                 ))
             })?;
     }
     // Like Local threads, the effort applies when the model offers it, and is skipped otherwise.
-    if let Some(value) = handle
-        .reasoning
+    if let Some(value) = effort
         .as_deref()
         .and_then(|level| thought_level(&options, level))
     {
@@ -95,6 +99,42 @@ pub(super) async fn start(handle: &Handle) -> io::Result<String> {
             .await?;
     }
     Ok(id)
+}
+
+/// The model names this Devin offers.
+fn models(options: &Value) -> Vec<String> {
+    let Some(option) = options["configOptions"]
+        .as_array()
+        .and_then(|all| all.iter().find(|option| option["id"] == "model"))
+    else {
+        return Vec::new();
+    };
+    option["options"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|choice| choice["value"].as_str().map(str::to_owned))
+        .collect()
+}
+
+/// The offered model for a requested one, and the effort its name carried.
+/// Older Devin put the effort in model names (`claude-opus-5-5-max`); newer Devin offers one name
+/// per model (`claude-opus-5-5-medium`) and sets the effort with `thought_level` (feedback #546).
+fn match_model(offered: &[String], requested: &str) -> (String, Option<String>) {
+    let is_effort = |text: &str| text == "minimal" || REASONING_LEVELS.contains(&text);
+    if !offered.iter().any(|model| model == requested)
+        && let Some((base, effort)) = requested.rsplit_once('-').filter(|(_, e)| is_effort(e))
+        && let Some(model) = offered.iter().find(|model| {
+            *model == base
+                || model
+                    .strip_prefix(base)
+                    .and_then(|rest| rest.strip_prefix('-'))
+                    .is_some_and(is_effort)
+        })
+    {
+        return (model.clone(), Some(effort.to_owned()));
+    }
+    (requested.to_owned(), None)
 }
 
 /// The model's `thought_level` value for an effort, with the fallbacks Local threads use.

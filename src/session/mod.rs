@@ -170,6 +170,16 @@ pub struct Session {
     // The website refused this limit's loop (an archived thread, 100 loops); the next limit tries again.
     #[serde(skip)]
     resume_refused: bool,
+    // The limit stopped a `plan_only` loop run, so its automatic continuations stay `plan_only` (ADR 0292).
+    #[serde(skip)]
+    resume_plan_only: bool,
+    // A `plan_only` turn being stopped because it would spend extra credits.
+    #[serde(skip)]
+    credits_stop: Option<String>,
+    // Whether the turn running now is guarded: set when a prompt's turn starts (replayed from its `starting_turn`
+    // record), kept by turns the harness starts itself.
+    #[serde(skip)]
+    guarded_turn: bool,
     #[serde(skip)]
     awake: Option<sleep::Awake>,
     // The harness was asked to exit so this idle session can sleep.
@@ -299,6 +309,10 @@ impl From<io::Error> for Error {
 }
 /// The most text one message to an agent can carry (ADR 0269).
 pub const MAX_PROMPT: usize = 256 * 1024;
+/// A `plan_only` loop run refused or stopped because its harness would spend extra credits (ADR 0292).
+pub(crate) const PLAN_ONLY_REFUSED: &str = "extra credits are off for loops";
+pub(crate) const PLAN_ONLY_STOPPED: &str =
+    "Stopped: this loop run would spend extra credits, and Stop at plan limit is on.";
 const JOURNAL_UNWRITABLE: &str = "session journal is not writable";
 type Result<T> = std::result::Result<T, Error>;
 
@@ -339,6 +353,15 @@ pub struct Manager {
     teleports: teleport::Transfers,
     /// Asks the history uploader to send now (a drain or stop), instead of at its next 30-second batch.
     uploads: tokio::sync::Notify,
+    /// Plan limits, credits and their ends the harnesses reported, still to be sent to the website, and until when
+    /// each harness pays with extra credits (ms), so `plan_only` loop runs never start meanwhile. Saved in the state
+    /// folder, so a restart keeps both (accounts.rs).
+    plan: Mutex<accounts::PlanState>,
+    /// The Codex plan limit the login check last saw, and the account it saw.
+    codex_reported: Mutex<Option<(bool, Option<u64>)>>,
+    codex_login: Mutex<Option<String>>,
+    /// When plan reports may be sent again after an outage, and the last wait (ms).
+    report_retry: Mutex<(u64, u64)>,
 }
 
 impl Manager {
@@ -442,6 +465,7 @@ impl Manager {
         let sync = crate::sync::Sync::open(&config)?;
         let previews = crate::preview::Previews::open(&config)?;
         let history = history::History::new(&config)?;
+        let plan = accounts::PlanState::load(&config.state_dir);
         let local = Arc::new(Mutex::new(local));
         let registry = local.clone();
         let observability = Observability::start(&config, history.api.clone(), move || {
@@ -469,6 +493,10 @@ impl Manager {
             cursor_auth: runtime::cursor_auth::CursorAuth::default(),
             stopping: AtomicBool::new(false),
             uploads: tokio::sync::Notify::new(),
+            codex_reported: Mutex::new(plan.codex_seen),
+            plan: Mutex::new(plan),
+            codex_login: Mutex::new(None),
+            report_retry: Mutex::new((0, 0)),
             // Bound cold-start CPU contention, not the number of running sessions.
             startups: Semaphore::new(
                 std::thread::available_parallelism().map_or(1, |n| (n.get() / 2).max(1)),
@@ -639,8 +667,18 @@ impl Manager {
         command: &str,
         input: &Value,
     ) -> Result<Option<Receipt>> {
+        // `plan_only` is guard metadata Core may add itself (an inherited resume), not the request's content.
+        let content = |input: &Value| {
+            let mut input = input.clone();
+            if let Some(fields) = input.as_object_mut() {
+                fields.remove("plan_only");
+            }
+            input
+        };
         match session.receipts.get(request) {
-            Some(receipt) if receipt.command != command || receipt.input != *input => {
+            Some(receipt)
+                if receipt.command != command || content(&receipt.input) != content(input) =>
+            {
                 Err(Error::Conflict("request_id already has different content"))
             }
             other => Ok(other.cloned()),
@@ -1076,6 +1114,15 @@ impl Manager {
                 return Err(Error::Conflict(
                     "this thread is no longer stopped by a plan limit",
                 ));
+            }
+            // No guarded prompt is accepted while its harness pays with extra credits; the automatic continuation of a
+            // `plan_only` loop run stays `plan_only` (ADR 0292).
+            let mut input = input;
+            if command == "prompt" && session.plan_only(&input) {
+                input["plan_only"] = json!(true);
+                if self.on_credits(session.harness) {
+                    return Err(Error::Conflict(PLAN_ONLY_REFUSED));
+                }
             }
             if command == "sleep" {
                 return self.request_sleep(&mut local, id, request);
@@ -1751,6 +1798,24 @@ impl Manager {
             let _ = local.append(id, "state", json!({"state":state}), None);
             return;
         }
+        // A queued `plan_only` loop run is checked again right before it starts (ADR 0292).
+        if let Some(next) = session.queue.first().cloned()
+            && session
+                .receipts
+                .get(&next)
+                .is_some_and(|r| r.input["plan_only"] == true)
+            && self.on_credits(session.harness)
+        {
+            let _ = local.finish_receipt_with(id, &next, "failed", Some(PLAN_ONLY_REFUSED.into()));
+            local
+                .sessions
+                .get_mut(id)
+                .unwrap()
+                .queue
+                .retain(|queued| queued != &next);
+            return self.advance(local, id, turn_ended);
+        }
+        let session = &local.sessions[id];
         if let Some(next) = session.queue.first().cloned()
             && let Some(handle) = session.handle.clone()
             && self.begin_turn(local, id, &next).is_ok()
@@ -1794,8 +1859,14 @@ impl Manager {
     ) {
         let manager = self.clone();
         tokio::spawn(async move {
+            let mut failed = false;
             while let Some(event) = events.recv().await {
-                if manager.record_native(&id, &handle, event).is_err() {
+                // After a failed record, only the harness exit still matters: it settles the turn (core #55).
+                if failed && !matches!(event, runtime::Event::Exited { .. }) {
+                    continue;
+                }
+                if manager.record_native(&id, &handle, event).is_err() && !failed {
+                    failed = true;
                     if let Some(handle) = manager
                         .local
                         .lock()
@@ -1806,7 +1877,6 @@ impl Manager {
                     {
                         handle.request_shutdown();
                     }
-                    break;
                 }
             }
         });
@@ -2097,8 +2167,38 @@ impl Manager {
                 local.append(id, "rewind", data, None)?;
                 self.advance(&mut local, id, true);
             }
-            runtime::Event::Record { kind, data, native } => {
+            runtime::Event::Record {
+                kind,
+                mut data,
+                native,
+            } => {
                 let usage = data.get("usage").cloned().filter(|value| !value.is_null());
+                // Plan limits and credits (ADR 0292). `plan_ok` only ends holds; it is not history.
+                if kind == "plan_ok" {
+                    if let Some(harness) = data["harness"].as_str() {
+                        self.clear_plan(harness, false);
+                    }
+                    return Ok(());
+                }
+                let current = local.sessions[id].current_request.clone();
+                // The running turn's guard; the harness's own continuation turns keep the guard of the turn they follow.
+                let plan_only = current.is_some() && local.sessions[id].guarded_turn;
+                if kind == "usage_limited" && plan_only {
+                    data["plan_only"] = json!(true);
+                }
+                if matches!(kind, "usage_limited" | "plan_credits") && data["model_only"] != true {
+                    self.report_limit(&data, kind == "plan_credits");
+                }
+                // A loop run that must not spend extra credits stops at their first sign (ADR 0292).
+                if kind == "plan_credits"
+                    && plan_only
+                    && let Some(request) = current
+                    && local.sessions[id].credits_stop.as_ref() != Some(&request)
+                {
+                    local.sessions.get_mut(id).unwrap().credits_stop = Some(request.clone());
+                    self.clone()
+                        .stop_for_credits(id.to_owned(), request, handle.clone());
+                }
                 local.append(id, kind, data, native)?;
                 if let Some(usage) = usage {
                     let _ = local.append(id, "usage", usage, None);
@@ -2153,6 +2253,16 @@ impl Manager {
                     let receipt = serde_json::to_value(receipt).map_err(io::Error::other)?;
                     local.append(id, "receipt", receipt, None)?;
                     self.begin_turn(&mut local, id, &request)?;
+                    // A guarded run's own continuation stops at once while its harness is known to be on credits.
+                    let session = &local.sessions[id];
+                    if session.guarded_turn && self.on_credits(session.harness) {
+                        local.sessions.get_mut(id).unwrap().credits_stop = Some(request.clone());
+                        self.clone().stop_for_credits(
+                            id.to_owned(),
+                            request.clone(),
+                            handle.clone(),
+                        );
+                    }
                 }
                 let session = &local.sessions[id];
                 if !session.ready || session.current_request.as_deref() != Some(&request) {
@@ -2174,6 +2284,13 @@ impl Manager {
                 // Only a loop that will fire may promise a resume time.
                 if local.sessions[id].limit_resumes >= accounts::MAX_RESUMES {
                     error = error.map(accounts::unpromise);
+                }
+                // A `plan_only` turn stopped for extra credits says so, once it really ended without completing.
+                if local.sessions[id].credits_stop.as_deref() == Some(&request) {
+                    local.sessions.get_mut(id).unwrap().credits_stop = None;
+                    if status != "completed" {
+                        error = Some(PLAN_ONLY_STOPPED.into());
+                    }
                 }
                 if local.sessions[id].current_request.as_deref() == Some(&request) {
                     let session = &local.sessions[id];
@@ -2270,7 +2387,10 @@ impl Manager {
                     None => format!("{reason} ({exit})"),
                 });
                 if let Some(request) = request {
-                    // Keep the cause on the lost turn: an automatic recovery leaves the thread idle and error-free.
+                    // Keep the cause on the lost turn: an automatic recovery leaves the thread idle and error-free. A
+                    // turn stopped for extra credits keeps that reason, so its loop never counts it as a failure.
+                    let stopped =
+                        local.sessions[id].credits_stop.as_deref() == Some(request.as_str());
                     local.finish_receipt_with(
                         id,
                         &request,
@@ -2279,7 +2399,11 @@ impl Manager {
                         } else {
                             "unknown_after_restart"
                         },
-                        (!expected).then(|| lost.clone()),
+                        if stopped {
+                            Some(PLAN_ONLY_STOPPED.into())
+                        } else {
+                            (!expected).then(|| lost.clone())
+                        },
                     )?;
                 }
                 for request in interrupts {
@@ -2314,6 +2438,7 @@ impl Manager {
                 if state != "suspended" && !preserve_queue {
                     local.fail_pending_because(id, Some(&lost))?;
                 }
+                local.sessions.get_mut(id).unwrap().credits_stop = None;
                 if recover {
                     self.schedule_resume(&mut local, id, true)?;
                 }
