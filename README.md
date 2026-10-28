@@ -10,7 +10,7 @@ Cloudroom core runs coding agents on your own Linux machine and saves their chat
 - Agents use your own logins to call their models.
 - One Rust service per machine. No Cloudroom account needed.
 
-Don't want to host it yourself? Hosted Cloudroom is invite-only for now. [Join the waitlist](https://www.cloudroom.dev/#waitlist).
+Don't want to host it yourself? [Get hosted Cloudroom free](https://www.cloudroom.dev).
 
 ![Cloudroom architecture: one cloud sandbox per agent, each running Cloudroom core and the agent.](docs/architecture.png)
 

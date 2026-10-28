@@ -4,13 +4,19 @@ import contextlib
 from http.server import BaseHTTPRequestHandler
 import http.client
 import importlib.util
+import json
 from pathlib import Path
+import os
+import socket
 import socketserver
+import shutil
+import sys
 import tempfile
 import threading
 import time
 from types import SimpleNamespace
 import unittest
+from unittest import mock
 
 spec = importlib.util.spec_from_file_location('preview', Path(__file__).parents[1] / 'src/preview/client.py')
 preview = importlib.util.module_from_spec(spec)
@@ -50,10 +56,12 @@ class App(BaseHTTPRequestHandler):
         self.end_headers(); self.wfile.write(data)
 
 
-class UnixServer(socketserver.ThreadingUnixStreamServer):
-    daemon_threads = True
+if hasattr(socketserver, 'ThreadingUnixStreamServer'):  # Windows' Python has no Unix sockets.
+    class UnixServer(socketserver.ThreadingUnixStreamServer):
+        daemon_threads = True
 
 
+@unittest.skipIf(sys.platform == 'win32', 'Unix sockets')
 class PreviewTests(unittest.TestCase):
     def setUp(self):
         self.directory = tempfile.TemporaryDirectory(prefix='cr-preview-', dir='/tmp')
@@ -111,6 +119,76 @@ class PreviewTests(unittest.TestCase):
             self.assertEqual(slow.result()[0], 405)
 
 
+class Json(BaseHTTPRequestHandler):
+    def log_message(self, *_):
+        pass
+
+    def do_POST(self):
+        body = json.dumps({'echo': json.loads(self.rfile.read(int(self.headers['Content-Length'])))}).encode()
+        self.send_response(200)
+        self.send_header('Content-Length', str(len(body)))
+        self.end_headers(); self.wfile.write(body)
+
+
+class ControlTests(unittest.TestCase):
+    def test_control_requests_reach_the_website_and_core(self):
+        # Every website and core call goes through control(); nothing else in the helper may take its name.
+        server = socketserver.ThreadingTCPServer(('127.0.0.1', 0), Json)
+        threading.Thread(target=server.serve_forever, kwargs={'poll_interval': .01}, daemon=True).start()
+        self.addCleanup(server.server_close); self.addCleanup(server.shutdown)
+        url = f'http://127.0.0.1:{server.server_address[1]}/api/desktop/sandboxes'
+        self.assertEqual(preview.control(url, {'action': 'awake'}, 'POST', {}), {'echo': {'action': 'awake'}})
+
+
+class UpstreamTimeoutTests(unittest.TestCase):
+    @unittest.skipIf(sys.platform == 'win32', 'Unix sockets')
+    def test_connect_to_a_full_socket_times_out(self):
+        # The timeout must apply to connect() itself, or a stuck tunnel blocks a browser request forever.
+        with tempfile.TemporaryDirectory(prefix='cr-preview-', dir='/tmp') as folder:
+            path = Path(folder) / 'full.sock'
+            listener = socket.socket(socket.AF_UNIX)
+            listener.bind(str(path)); listener.listen(0)
+            waiting = []
+            try:
+                while True:
+                    client = socket.socket(socket.AF_UNIX); client.setblocking(False); waiting.append(client)
+                    client.connect(str(path))
+            except BlockingIOError:
+                pass
+            upstream = preview.Upstream(path)
+            upstream.timeout = .3
+            failures = []
+            def connect():
+                try:
+                    upstream.connect()
+                except OSError as error:
+                    failures.append(error)
+            attempt = threading.Thread(target=connect, daemon=True)
+            attempt.start(); attempt.join(3)
+            self.assertFalse(attempt.is_alive(), 'connect() ignored the timeout')
+            self.assertEqual(len(failures), 1)
+            for client in [*waiting, listener]:
+                client.close()
+
+
+@unittest.skipUnless(sys.platform == 'win32', 'Windows helper lifecycle')
+class WindowsLifecycleTests(unittest.TestCase):
+    def test_start_confirms_and_stop_asks_the_helper_to_exit(self):
+        with tempfile.TemporaryDirectory() as folder:
+            folder = Path(folder)
+            shutil.copyfile(spec.origin, folder / 'client.py')
+            (folder / 'pid').write_text(str(os.getpid()))  # An old helper's pid file must never be used to stop anything.
+            preview.windows(folder, False)
+            self.assertTrue(preview.running(folder))
+            self.assertTrue((folder / 'started').read_text())
+            with self.assertRaises(OSError):  # A second start can't take the lock; it ends, and the running helper stays.
+                preview.windows(folder, False)
+            self.assertTrue(preview.running(folder))
+            preview.windows(folder, True)
+            self.assertFalse(preview.running(folder))
+            preview.windows(folder, True)  # Stopping a stopped helper is a no-op.
+
+
 class MacJobTests(unittest.TestCase):
     def test_job_core_gave_up_on_never_runs(self):
         # Feedback #247: a slow Mac ran a --write job after Core told the agent "Mac unavailable", so a retry ran it twice.
@@ -125,6 +203,27 @@ class MacJobTests(unittest.TestCase):
             preview.MacJobs(folder).execute(core, 'mac', {'id': 'job', 'command': f'touch {folder}/ran', 'write': True})
             self.assertFalse((folder / 'ran').exists())
             self.assertEqual(posted, ['running'])
+
+    def test_ask_first_popup_shows_agent_text_as_text(self):
+        # Security sweep: line breaks in a folder name could push the command out of view in the Ask first popup.
+        shown = []
+        class Popup:
+            def __init__(self, args, **_):
+                shown.append(args[3])
+            def communicate(self):
+                return 'Allow\n', None
+        job = {'id': 'job', 'command': 'bash -s\necho two\N{RIGHT-TO-LEFT OVERRIDE}', 'cwd': '/tmp/a\nb' + 'c' * 300,
+               'write': True, 'stdin': ''.join(f'echo {n}\r\n' for n in range(25)).encode().hex()}
+        with mock.patch.object(preview.subprocess, 'Popen', Popup):
+            self.assertTrue(preview.MacJobs(Path('/unused')).approve(SimpleNamespace(key='core'), job))
+        lines = shown[0].split('\n')
+        self.assertEqual(lines[2:12], ['Warning: 44 more characters of its input are not shown, and will also run.', '',
+                                       'Command:', '    bash -s', '    echo two\\u202e', '',
+                                       'Folder: /tmp/a\\nb' + 'c' * 191 + '…', '', 'Input (25 lines):', '    echo 0\\r'])
+        self.assertEqual(lines[12:], [f'    echo {n}\\r' for n in range(1, 20)])
+        self.assertTrue(all(c.isprintable() or c == '\n' for c in shown[0]))
+        # Escapes count against the limit, and the hidden count stays in the agent's own characters.
+        self.assertEqual(preview.visible('\0' * 300, 600, 10), ('\\x00' * 150, 150))
 
 
 if __name__ == '__main__':

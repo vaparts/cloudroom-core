@@ -556,3 +556,38 @@ async fn check_shutdown(model: &str) {
         .unwrap()
     );
 }
+
+#[test]
+fn command_guard_blocks_common_dangerous_variants() {
+    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/runtime/command-guard.mjs");
+    let script = r#"
+const { checkCommand } = await import("file://" + process.argv[1]);
+for (const command of [
+  "dd of=/dev/xvda",
+  "dd of=/dev/mmcblk0",
+  "echo x>/dev/xvda",
+  "echo x>/dev/mmcblk0",
+  "sudo -n rm -rf /",
+  "sudo -- rm -rf /",
+  "command -- rm -rf /",
+  "mke2fs /dev/sda",
+]) {
+  if (checkCommand(command) === null) throw new Error(`Allowed dangerous command: ${command}`);
+}
+for (const command of ["command -v mkfs", "command -V mke2fs", "sudo " + "-- ".repeat(26) + "true"]) {
+  const started = performance.now();
+  if (checkCommand(command) !== null) throw new Error(`Blocked safe command: ${command}`);
+  if (performance.now() - started > 1000) throw new Error(`Slow check: ${command}`);
+}
+"#;
+    let output = Command::new("node")
+        .args(["--input-type=module", "-e", script])
+        .arg(source)
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}

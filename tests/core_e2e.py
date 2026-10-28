@@ -20,6 +20,8 @@ import tempfile
 import time
 
 ROOT = Path(__file__).resolve().parents[1]
+# CI points this at the optimized build it ships (ADR 0296).
+BINARY = Path(os.environ.get('CLOUDROOM_BIN') or ROOT / 'target/debug/cloudroom')
 
 
 def run(*args, **kwargs):
@@ -62,13 +64,13 @@ def descendants(pid):
         for task in Path(f"/proc/{parent}/task").glob("*/children"):
             try:
                 children = task.read_text().split()
-            except FileNotFoundError:
+            except (FileNotFoundError, ProcessLookupError):
                 continue
             for child in children:
                 if child not in result:
                     try:
                         identity = Path(f"/proc/{child}/stat").read_text().rsplit(")", 1)[1].split()[19]
-                    except FileNotFoundError:
+                    except (FileNotFoundError, ProcessLookupError):
                         continue
                     result[child] = identity
                     pending.append(child)
@@ -82,7 +84,7 @@ def running_processes(owned):
             stat = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()
             if stat[19] == identity and stat[0] != "Z":
                 running.append(pid)
-        except FileNotFoundError:
+        except (FileNotFoundError, ProcessLookupError):
             pass
     return running
 
@@ -104,7 +106,7 @@ class Service:
 
     def start(self):
         self.log = self.log_path.open("w+")
-        self.process = subprocess.Popen([str(ROOT / "target/debug/cloudroom")], env=self.env,
+        self.process = subprocess.Popen([str(BINARY)], env=self.env,
                                         stdout=self.log, stderr=self.log, start_new_session=True)
         def address():
             assert self.process.poll() is None, "core exited: " + self.log_path.read_text()
@@ -231,7 +233,7 @@ def main():
     args = parser.parse_args()
     if args.fixture and args.harness != "codex":
         raise SystemExit("Use tests/pi_http.py for mixed protocol fixtures")
-    if not (ROOT / "target/debug/cloudroom").is_file():
+    if not BINARY.is_file():
         raise SystemExit("BLOCKED: run CARGO_BUILD_JOBS=1 cargo build --locked")
     if not Path("/proc/self/stat").is_file():
         raise SystemExit("BLOCKED: these end-to-end checks require Linux /proc; use tests/core_fixture.py for local HTTP checks")
@@ -294,7 +296,7 @@ def main():
                 result = service.request("GET", "/v1/health", expected=expected, token=token)
                 if expected == 200:
                     assert result["status"] == "ready"
-            collision = subprocess.run([str(ROOT / "target/debug/cloudroom")], env=env, capture_output=True, timeout=5)
+            collision = subprocess.run([str(BINARY)], env=env, capture_output=True, timeout=5)
             assert collision.returncode != 0
             passed("HTTP auth, client reconnection, and exclusive state ownership")
             if args.fixture:

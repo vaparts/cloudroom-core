@@ -14,7 +14,7 @@ import time
 import unittest
 import uuid
 
-from core_e2e import Service, run, until, next_event
+from core_e2e import BINARY, Service, run, until, next_event
 
 
 def codex():
@@ -314,7 +314,7 @@ class ReplayTests(unittest.TestCase):
         self.assertNotIn('PRIVATE-AUTH-ERROR-CANARY', json.dumps(self.service.request('GET', '/v1/accounts/codex')))
 
     def test_non_loopback_http_requires_permission_before_storage_or_binding(self):
-        binary = Path(__file__).resolve().parents[1] / 'target/debug/cloudroom'
+        binary = BINARY
         remote = ['0.0.0.0:0', '[::]:0', '192.0.2.10:0', '10.0.0.10:0', '[2001:db8::10]:0']
         for listen in remote:
             for permission in [None, '', '0', 'true', '01', ' 1 ', '1']:
@@ -622,6 +622,15 @@ class RecoveryTests(unittest.TestCase):
         self.wait(lambda: self.status()["state"] == "idle", "resumed idle session")
         self.assertEqual(self.status()["native_id"], self.native)
 
+    def test_settings_leave_out_the_growing_history(self):
+        self.seed(extra=[("receipt", {"request_id": f"p{n}", "command": "prompt", "input": {"text": "x" * 1000}, "state": "completed"}) for n in range(50)])
+        self.start(); self.ready()
+        settings = self.service.request("GET", "/v1/sessions/cr_seed/settings")["session"]
+        self.assertEqual(settings["harness"], self.status()["harness"])
+        self.assertEqual(list(settings["receipts"]), ["seed"])
+        self.assertEqual(settings["receipts"]["seed"]["command"], "start")
+        self.assertFalse(settings["archived"])
+
     def test_a_limit_ends_once_newer_queued_work_runs(self):
         # The limit lands after newer work was queued behind its turn. Once that work runs, the earlier limit must
         # neither keep a resume loop nor let one queue an unsolicited "keep working", while it runs or after.
@@ -674,7 +683,7 @@ class RecoveryTests(unittest.TestCase):
         with socket.socket() as occupied:
             occupied.bind(('127.0.0.1',0)); occupied.listen()
             env = {**self.env,'CLOUDROOM_LISTEN':'127.0.0.1:'+str(occupied.getsockname()[1])}
-            failed = subprocess.run([str(Path(__file__).resolve().parents[1]/'target/debug/cloudroom')],env=env,capture_output=True,timeout=8)
+            failed = subprocess.run([str(BINARY)],env=env,capture_output=True,timeout=8)
             self.assertNotEqual(failed.returncode,0)
             self.assertEqual(before,{p.name:p.read_bytes() for p in self.state.glob('*.record')})
         self.start()

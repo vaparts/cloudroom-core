@@ -61,6 +61,8 @@ pub const FEATURES: &[&str] = &[
     "files_wait",
     "long_prompts",
     "agent_limits",
+    "plan_only",
+    "loop_report",
 ];
 
 pub async fn serve(mut config: config::Config) -> Result<(), Box<dyn std::error::Error>> {

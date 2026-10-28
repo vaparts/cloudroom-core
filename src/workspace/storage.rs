@@ -448,12 +448,21 @@ pub fn clean_npm_cache(root: &Path, groups: &Path) -> io::Result<usize> {
         collections::HashSet,
         os::{fd::AsRawFd, unix::fs::OpenOptionsExt},
     };
+    // Linux numbers open flags per CPU: x86_64's O_NOFOLLOW | O_DIRECTORY means O_LARGEFILE | O_DIRECT on aarch64.
+    #[cfg(target_arch = "x86_64")]
+    const NOFOLLOW: i32 = 0x20000;
+    #[cfg(target_arch = "x86_64")]
+    const DIRECTORY: i32 = 0x10000;
+    #[cfg(target_arch = "aarch64")]
+    const NOFOLLOW: i32 = 0x8000;
+    #[cfg(target_arch = "aarch64")]
+    const DIRECTORY: i32 = 0x4000;
     let open = |path: &Path| {
         fs::OpenOptions::new()
             .read(true)
-            .custom_flags(0x20000 | 0x10000)
+            .custom_flags(NOFOLLOW | DIRECTORY)
             .open(path)
-    }; // O_NOFOLLOW | O_DIRECTORY
+    };
     let mut dir = open(root)?;
     for name in ["npm", "_cacache", "content-v2", "sha512"] {
         let next = PathBuf::from(format!("/proc/self/fd/{}/{}", dir.as_raw_fd(), name));
@@ -551,7 +560,7 @@ pub fn clean_npm_cache(root: &Path, groups: &Path) -> io::Result<usize> {
                     // A cache-shaped filename alone never makes customer data disposable.
                     let file = fs::OpenOptions::new()
                         .read(true)
-                        .custom_flags(0x20000)
+                        .custom_flags(NOFOLLOW)
                         .open(leaf.path())?;
                     let opened = file.metadata()?;
                     if (opened.dev(), opened.ino()) != (m.dev(), m.ino()) {

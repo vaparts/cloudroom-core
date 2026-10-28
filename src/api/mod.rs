@@ -77,6 +77,7 @@ pub fn router(manager: Arc<Manager>, token: String) -> Router {
         .route("/v1/sessions", post(start).get(list_sessions))
         .route("/v1/sessions/{id}", get(status))
         .route("/v1/sessions/{id}/requests/{request}", get(request_status))
+        .route("/v1/sessions/{id}/settings", get(session_settings))
         .route("/v1/sessions/{id}/workspace", get(session_workspace))
         .route("/v1/sessions/{id}/recovery", get(recovery))
         .route("/v1/sessions/{id}/prompts", post(prompt))
@@ -294,11 +295,19 @@ async fn drain(State(manager): State<Arc<Manager>>, Json(input): Json<Drain>) ->
     let mut answer = manager.drain(input.hold);
     // The sandbox stops next: save what's pending first. Anything left stays in the journal for the next wake.
     if answer["drained"] == true {
-        answer["pending_records"] = json!(
-            manager
-                .flush_history(std::time::Duration::from_secs(8))
-                .await
+        // Plan limits seen here reach the website before the sandbox stops (ADR 0292), alongside the history
+        // flush and within its budget: the website gives the whole drain 10 s.
+        let (sent, pending) = tokio::join!(
+            tokio::time::timeout(
+                std::time::Duration::from_secs(7),
+                manager.send_plan_reports()
+            ),
+            manager.flush_history(std::time::Duration::from_secs(8)),
         );
+        if sent.is_err() {
+            manager.delay_plan_reports();
+        }
+        answer["pending_records"] = json!(pending);
     }
     Json(answer)
 }
@@ -551,7 +560,7 @@ impl IntoResponse for session::Error {
             "cloud execution already owns this transfer; use Stop" => "teleport_running",
             "Cloud folder permission denied" => "attachment_permission_denied",
             "attachment upload failed" => "invalid_attachment",
-            "image exceeds the 10 MiB limit" | "file exceeds the 25 MiB limit" => {
+            "image exceeds the 10 MiB limit" | "file exceeds the 100 MiB limit" => {
                 "attachment_too_large"
             }
             "request_id already has different content"
@@ -570,6 +579,7 @@ impl IntoResponse for session::Error {
             "connect Claude Code before starting cloud work" => "claude_auth_required",
             "Claude account could not be verified" => "claude_auth_unavailable",
             "Codex usage limit reached" => "codex_usage_limit",
+            "extra credits are off for loops" => "plan_credits",
             "Codex account could not be verified" => "codex_auth_unavailable",
             "connect Cursor before starting cloud work" => "cursor_auth_required",
             "Cursor account could not be verified" => "cursor_auth_unavailable",
@@ -642,6 +652,9 @@ struct Prompt {
     reasoning: Option<String>,
     #[serde(default)]
     service_tier: Option<String>,
+    /// A loop run that must not spend extra credits (ADR 0292); `false` says it is not guarded, even as a resume.
+    #[serde(default)]
+    plan_only: Option<bool>,
 }
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -958,7 +971,28 @@ async fn request_status(
         "archived": session.archived,
         "state": receipt.map(|r| if cancelled && r.state == "accepted" { "cancelled" } else { r.state.as_str() }),
         "error": receipt.and_then(|r| r.error.as_ref()),
+        // A guarded loop run refused before it started never ran: its text, so the website can send it again.
+        "refused_text": receipt
+            .filter(|r| r.error.as_deref() == Some(session::PLAN_ONLY_REFUSED))
+            .map(|r| &r.input["text"]),
     })))
+}
+/// The session's settings and its first start, without its growing history: the full session keeps every prompt, and
+/// long threads passed the website's read limit (2026-10-26). Same shape as `status`, so the website reads either.
+async fn session_settings(
+    State(manager): State<Arc<Manager>>,
+    Path(id): Path<String>,
+) -> Result<Json<Value>> {
+    let s = manager.session(&id).await?;
+    let start = s.receipts.iter().find(|(_, r)| r.command == "start");
+    let receipts: serde_json::Map<String, Value> = start
+        .map(|(key, r)| (key.clone(), json!({"command":r.command,"input":r.input})))
+        .into_iter()
+        .collect();
+    Ok(Json(json!({"session":{
+        "harness":s.harness,"reasoning":s.reasoning,"provider":s.provider,"archived":s.archived,
+        "workspace":s.workspace,"receipts":receipts,
+    }})))
 }
 async fn recovery(
     State(manager): State<Arc<Manager>>,
@@ -1014,15 +1048,19 @@ async fn prompt(
     Json(body): Json<Prompt>,
 ) -> Result<impl IntoResponse> {
     key(&body.request_id)?;
-    let input = prompt_input(
+    let mut input = prompt_input(
         body.text,
         body.content,
         body.attachments,
         body.reasoning.clone(),
         body.service_tier.clone(),
     )?;
+    if let Some(plan_only) = body.plan_only {
+        input["plan_only"] = json!(plan_only);
+    }
     // An accepted retry must not depend on the model catalog still being available.
     if !manager.known_request(&id, &body.request_id) {
+        manager.check_plan_only(&id, &input).await?;
         if body.reasoning.as_deref().is_some_and(|level| {
             level.is_empty() || level.len() > 64 || !level.bytes().all(|b| b.is_ascii_lowercase())
         }) {
@@ -1247,13 +1285,13 @@ async fn attach(
             let limit = if query.kind == "image" {
                 10 << 20
             } else {
-                25 << 20
+                100 << 20
             };
             if total > limit {
                 return Err(session::Error::Conflict(if query.kind == "image" {
                     "image exceeds the 10 MiB limit"
                 } else {
-                    "file exceeds the 25 MiB limit"
+                    "file exceeds the 100 MiB limit"
                 }));
             }
             match attach_part(&key, offset, total, &part).map_err(session::Error::Conflict)? {
@@ -1293,7 +1331,7 @@ async fn attach(
                 std::io::ErrorKind::FileTooLarge if query.kind == "image" => {
                     "image exceeds the 10 MiB limit"
                 }
-                std::io::ErrorKind::FileTooLarge => "file exceeds the 25 MiB limit",
+                std::io::ErrorKind::FileTooLarge => "file exceeds the 100 MiB limit",
                 _ => "attachment upload failed",
             })
         })?;

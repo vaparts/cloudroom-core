@@ -210,10 +210,14 @@ impl Workspaces {
 
     pub async fn ensure_directory(&self, workspace: &Workspace) -> io::Result<()> {
         self.check_filesystem(&workspace.path)?;
-        if workspace.id != "legacy" {
+        let unregistered_legacy = workspace.id == "legacy"
+            && !self.read_registered("legacy")?.is_some_and(|registered| {
+                registered.path == workspace.path && registered.parent == workspace.parent
+            });
+        if !unregistered_legacy {
             self.validate(workspace)?;
         }
-        let path = if workspace.id == "legacy" {
+        let path = if unregistered_legacy {
             workspace.path.canonicalize()?
         } else {
             workspace.path.clone()
@@ -402,7 +406,7 @@ impl Workspaces {
         let limit = if kind == "image" {
             10 * 1024 * 1024
         } else {
-            25 * 1024 * 1024
+            100 * 1024 * 1024
         };
         let mut bytes = Vec::new();
         let mut stream = body.into_data_stream();

@@ -106,7 +106,7 @@ test("attachment failures distinguish permissions and size without disclosing se
   t.after(() => service.close());
   for (const [rejection, message] of [
     ["attachment_permission_denied", "Cloud folder permission denied"],
-    ["attachment_too_large", "The attachment exceeds the Cloud size limit (10 MiB per image, 25 MiB per file)."],
+    ["attachment_too_large", "The attachment exceeds the Cloud size limit (10 MiB per image, 100 MiB per file)."],
     ["invalid_attachment", "The attachment could not be stored on Cloud."],
   ]) {
     code = rejection;

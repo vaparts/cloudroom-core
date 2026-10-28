@@ -10,6 +10,52 @@ const RESUME_CHECK: Duration = Duration::from_secs(10);
 /// saved paused, so only an account switch runs it and wakes the sandbox (web/lib/automations.ts
 /// `resumeAfterSwitch`). Its time is a placeholder.
 const PAUSED_SECS: u64 = 30 * 24 * 60 * 60;
+/// How long a plan limit holds the account's loops when the harness gave no reset time (Pi, some credits).
+const LIMIT_HOLD_MS: u64 = 60 * 60 * 1000;
+/// A report like the last one sent (same credits, a reset within 10 minutes) waits this long, so a limit with an
+/// unknown reset renews the website's one-hour hold without a write on every event.
+const REPORT_AGAIN_MS: u64 = 20 * 60 * 1000;
+const SAME_RESET_MS: u64 = 10 * 60 * 1000;
+const PLAN_FILE: &str = "plan-limits.json";
+
+/// Plan limits, credits and their ends still to be sent to the website (the newest per harness, with a generation so
+/// an older one in flight never replaces it), what each harness last sent, until when each harness pays with extra
+/// credits (ms), and the login each hold belongs to. Saved in the state folder, so a restart keeps them (ADR 0292).
+#[derive(Default, Serialize, Deserialize)]
+pub(super) struct PlanState {
+    #[serde(default)]
+    credits_until: BTreeMap<String, u64>,
+    #[serde(default)]
+    /// Per harness: (generation, report, the login it was seen with).
+    reports: BTreeMap<String, (u64, Value, Option<String>)>,
+    #[serde(default)]
+    generation: u64,
+    /// Per harness: (credits, until, sent at); a cleared harness has until 0.
+    #[serde(default)]
+    sent: BTreeMap<String, (bool, u64, u64)>,
+    /// The login a credits hold was seen with; another login means the hold is not its own.
+    #[serde(default)]
+    logins: BTreeMap<String, String>,
+    /// The Codex limit its login check last saw: (credits, reset ms).
+    #[serde(default)]
+    pub(super) codex_seen: Option<(bool, Option<u64>)>,
+}
+impl PlanState {
+    pub(super) fn load(dir: &std::path::Path) -> Self {
+        std::fs::read(dir.join(PLAN_FILE))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+            .unwrap_or_default()
+    }
+    fn save(&self, dir: &std::path::Path) {
+        let (path, tmp) = (dir.join(PLAN_FILE), dir.join(format!("{PLAN_FILE}.tmp")));
+        if let Ok(bytes) = serde_json::to_vec(self)
+            && std::fs::write(&tmp, bytes).is_ok()
+        {
+            let _ = std::fs::rename(&tmp, &path);
+        }
+    }
+}
 
 /// A plan-limit error that promised a resume time Core will not keep (4 resumes used): point to a switch instead.
 pub(super) fn unpromise(mut error: String) -> String {
@@ -44,6 +90,12 @@ enum Change {
 }
 
 impl Session {
+    /// Whether a prompt is a guarded loop run (ADR 0292): sent with `plan_only`, or a resume prompt inheriting it.
+    pub(super) fn plan_only(&self, input: &Value) -> bool {
+        input["plan_only"] == true
+            || (input.get("plan_only").is_none() && self.resume_plan_only && resume_prompt(input))
+    }
+
     /// A resume prompt runs only from this limit's own loop, while the limit still stops the thread and no newer work
     /// waits. One from a retired or unknown loop, or sent after the thread moved on or was stopped, is refused.
     pub(super) fn resume_accepts(&self, request: &str, input: &Value) -> bool {
@@ -122,16 +174,117 @@ impl Manager {
 
     pub async fn codex_auth_status(self: &Arc<Self>) -> runtime::auth::Status {
         let status = self.codex_auth.status(&self.config).await;
-        if self.codex_auth.take_switched().await {
+        let switched = self.codex_auth.take_switched().await;
+        // The old login's limits go first; the new login's status applies before any work continues.
+        if switched {
+            self.codex_login_changed();
+        }
+        self.apply_codex_status(&status);
+        if switched {
             self.continue_limited(&[runtime::Kind::Codex, runtime::Kind::Pi]);
         }
         status
+    }
+
+    /// The login check is where real Codex shows its plan limit and reset (ADR 0292). A failed check says nothing.
+    fn apply_codex_status(&self, status: &runtime::auth::Status) {
+        if !matches!(status.state, "connected" | "limited") {
+            return;
+        }
+        *self.codex_login.lock().unwrap() = status.email.clone();
+        let seen = std::mem::replace(&mut *self.codex_reported.lock().unwrap(), status.limit);
+        if seen != status.limit {
+            let mut plan = self.plan.lock().unwrap();
+            plan.codex_seen = status.limit;
+            plan.save(&self.config.state_dir);
+        }
+        match status.limit {
+            Some((credits, resets)) => {
+                self.report_limit(&json!({"harness":"codex","resets_at_ms":resets}), credits)
+            }
+            // Only a limit this check saw ends here: a turn's limit may be another bucket (a model's) than the
+            // account-wide one this check reads; it ends with that turn's own signal or its reset.
+            None if seen.is_some() => self.clear_plan("codex", false),
+            None => {}
+        }
+    }
+
+    /// A loop run marked `plan_only` never starts while its harness pays with extra credits (ADR 0292). Codex is checked
+    /// through its login check (cached up to 15 s, given at most 5 s here); other harnesses by the credits their turns
+    /// here last reported.
+    pub async fn check_plan_only(self: &Arc<Self>, id: &str, input: &Value) -> Result<()> {
+        let Some(harness) = self
+            .local
+            .lock()
+            .unwrap()
+            .sessions
+            .get(id)
+            .filter(|s| s.plan_only(input))
+            .map(|s| s.harness)
+        else {
+            return Ok(());
+        };
+        if harness == runtime::Kind::Codex {
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.codex_auth_status()).await;
+        }
+        if self.on_credits(harness) {
+            return Err(Error::Conflict(super::PLAN_ONLY_REFUSED));
+        }
+        Ok(())
+    }
+
+    /// Whether this harness pays with extra credits now, as its turns and login checks last reported. A hold seen with
+    /// another login (a switch while this sandbox slept) is dropped, with that login's unsent report.
+    pub(super) fn on_credits(&self, harness: runtime::Kind) -> bool {
+        let Some(name) = serde_json::to_value(harness)
+            .ok()
+            .and_then(|v| v.as_str().map(str::to_owned))
+        else {
+            return false;
+        };
+        let login = self.login_of(&name);
+        let mut plan = self.plan.lock().unwrap();
+        if let (Some(login), Some(held)) = (login, plan.logins.get(&name))
+            && login != *held
+        {
+            plan.credits_until.remove(&name);
+            plan.logins.remove(&name);
+            plan.reports.remove(&name);
+            plan.save(&self.config.state_dir);
+            return false;
+        }
+        plan.credits_until
+            .get(&name)
+            .is_some_and(|until| *until > now_ms())
+    }
+
+    /// The login a harness runs with now, when Core can tell, as a stable hash (FNV-1a), so the login itself is never
+    /// saved: Claude Code's login files, Codex's account email.
+    fn login_of(&self, harness: &str) -> Option<String> {
+        let bytes = match harness {
+            "claude-code" => runtime::claude_login(&self.config),
+            "codex" => self.codex_login.lock().unwrap().clone()?.into_bytes(),
+            _ => return None,
+        };
+        let hash = bytes.iter().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(*byte)).wrapping_mul(0x0100_0000_01b3)
+        });
+        Some(format!("{hash:016x}"))
+    }
+
+    /// A new Codex login: the old account's limits and credits no longer apply, here or on the website.
+    fn codex_login_changed(&self) {
+        *self.codex_reported.lock().unwrap() = None;
+        self.clear_plan("codex", true);
+        self.clear_plan("pi", true);
     }
 
     /// Verify a login installed outside the core, then continue quota-stopped work.
     pub async fn codex_switched(self: &Arc<Self>) -> (runtime::auth::Status, Vec<String>) {
         let status = self.codex_auth.verify(&self.config).await;
         let continued = if status.state == "connected" {
+            self.codex_login_changed();
+            self.apply_codex_status(&status);
             self.continue_limited(&[runtime::Kind::Codex, runtime::Kind::Pi])
         } else {
             Vec::new()
@@ -141,6 +294,7 @@ impl Manager {
 
     /// The website wrote a new Claude login (ADR 0197): continue Claude work its plan limit stopped.
     pub fn claude_switched(self: &Arc<Self>) -> Vec<String> {
+        self.clear_plan("claude-code", true);
         self.continue_limited(&[runtime::Kind::Claude])
     }
 
@@ -173,10 +327,15 @@ impl Manager {
             .collect();
         let mut continued = Vec::new();
         for id in ids {
+            // The continuation of a `plan_only` loop run stays `plan_only` (ADR 0292).
+            let mut input = json!({"text":"keep working"});
+            if local.sessions[&id].resume_plan_only {
+                input["plan_only"] = json!(true);
+            }
             let receipt = Receipt {
                 request_id: format!("continue_{}", now_ms()),
                 command: "prompt".into(),
-                input: json!({"text":"keep working"}),
+                input,
                 state: "accepted".into(),
                 model: None,
                 provider: None,
@@ -215,10 +374,208 @@ impl Manager {
         });
     }
 
+    /// Queues a plan limit, or a switch to paid credits, for the website, which holds the account's Cloud loops on
+    /// that harness until it resets (ADR 0292). A report like the last one sent waits `REPORT_AGAIN_MS`. Each report
+    /// says when it was seen (`at`), so the website ignores one older than a clear, and carries its login, so it is
+    /// dropped unsent once another login is in use.
+    pub(super) fn report_limit(&self, data: &Value, credits: bool) {
+        let Some(harness) = data["harness"].as_str() else {
+            return;
+        };
+        let now = now_ms();
+        // A Codex turn at its limit carries no reset (real Codex sends `primary: null` then); its login check does.
+        let known = (harness == "codex")
+            .then(|| {
+                self.codex_reported
+                    .lock()
+                    .unwrap()
+                    .and_then(|(_, resets)| resets)
+            })
+            .flatten()
+            .filter(|at| *at > now);
+        let reset = data["resets_at_ms"].as_u64().or(known);
+        let until = reset.unwrap_or(now + LIMIT_HOLD_MS);
+        let login = self.login_of(harness);
+        let mut plan = self.plan.lock().unwrap();
+        // Paying with credits until the reset, for this login; a hard limit means no credits are being spent.
+        let paid = plan.credits_until.get(harness).copied();
+        if credits {
+            plan.credits_until
+                .insert(harness.to_owned(), paid.unwrap_or(0).max(until));
+            match login.clone() {
+                Some(login) => plan.logins.insert(harness.to_owned(), login),
+                None => plan.logins.remove(harness),
+            };
+        } else {
+            plan.credits_until.remove(harness);
+        }
+        // A guessed reset moves with every report, so only its credits and age decide a repeat.
+        let repeat = plan.sent.get(harness).is_some_and(|&(was, sent, at)| {
+            was == credits
+                && sent != 0
+                && (reset.is_none() || sent.abs_diff(until) < SAME_RESET_MS)
+                && now.saturating_sub(at) < REPORT_AGAIN_MS
+        });
+        if !repeat && self.history.api.is_some() {
+            plan.generation += 1;
+            let generation = plan.generation;
+            let report = json!({"harness":harness,"until":until,"credits":credits,"at":now});
+            plan.reports
+                .insert(harness.to_owned(), (generation, report, login));
+            plan.sent.insert(harness.to_owned(), (credits, until, now));
+        }
+        if !repeat || plan.credits_until.get(harness).copied() != paid {
+            plan.save(&self.config.state_dir);
+        }
+    }
+
+    /// The harness is on its plan again (a reset, an upgrade) or another login is in use (`switch`): its credits hold
+    /// ends here and, through a `clear` report, on the website. Without a switch, only if this Core held or reported
+    /// that harness, so healthy sandboxes add no traffic.
+    pub(super) fn clear_plan(&self, harness: &str, switch: bool) {
+        let now = now_ms();
+        let mut plan = self.plan.lock().unwrap();
+        let held = plan.credits_until.remove(harness).is_some();
+        plan.logins.remove(harness);
+        let reported = plan
+            .sent
+            .get(harness)
+            .is_some_and(|&(_, until, _)| until != 0);
+        if !switch && !held && !reported {
+            return;
+        }
+        // A clear replaces any report still waiting for this harness, so an older one is never sent after it.
+        if self.history.api.is_some() {
+            plan.generation += 1;
+            let generation = plan.generation;
+            let report = json!({"harness":harness,"clear":true,"at":now});
+            plan.reports
+                .insert(harness.to_owned(), (generation, report, None));
+            plan.sent.insert(harness.to_owned(), (false, 0, now));
+        } else {
+            plan.reports.remove(harness);
+            plan.sent.remove(harness);
+        }
+        plan.save(&self.config.state_dir);
+    }
+
+    /// Stops a `plan_only` turn that would spend extra credits: interrupts it, tries again while it still runs (Codex
+    /// needs its turn ID first), and stops the harness if no interrupt lands, so no more paid requests go out.
+    pub(super) fn stop_for_credits(
+        self: Arc<Self>,
+        id: String,
+        request: String,
+        handle: runtime::Handle,
+    ) {
+        tokio::spawn(async move {
+            let running = |manager: &Self| {
+                manager
+                    .local
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get(&id)
+                    .is_some_and(|s| s.current_request.as_deref() == Some(request.as_str()))
+            };
+            // At most 10 s in all: each interrupt may wait on a stuck harness.
+            let landed = tokio::time::timeout(Duration::from_secs(10), async {
+                for attempt in 1..=5 {
+                    if handle.interrupt(&request).await.is_ok() || !running(&self) {
+                        return true;
+                    }
+                    tokio::time::sleep(Duration::from_millis(400 * attempt)).await;
+                }
+                false
+            })
+            .await
+            .unwrap_or(false);
+            if !landed && running(&self) {
+                // The turn ends as lost, not interrupted; its receipt still says why.
+                if let Some(receipt) = self
+                    .local
+                    .lock()
+                    .unwrap()
+                    .sessions
+                    .get_mut(&id)
+                    .and_then(|s| s.receipts.get_mut(&request))
+                {
+                    receipt.error = Some(super::PLAN_ONLY_STOPPED.into());
+                }
+                handle.request_shutdown();
+            }
+        });
+    }
+
+    /// Sends the newest report per harness. An outage keeps it and backs off (10 s doubling to 5 min); a refusal
+    /// drops it. A report replaced while in flight (a newer limit, a clear, a switch) is never put back, and one seen
+    /// with a login no longer in use is dropped unsent. Also runs before the sandbox stops (`/v1/drain`).
+    pub async fn send_plan_reports(&self) {
+        let Some(api) = &self.history.api else {
+            return;
+        };
+        let now = now_ms();
+        if now < self.report_retry.lock().unwrap().0 {
+            return;
+        }
+        let reports: Vec<(String, u64, Value, Option<String>)> = {
+            let plan = self.plan.lock().unwrap();
+            plan.reports
+                .iter()
+                .map(|(harness, (generation, report, login))| {
+                    (harness.clone(), *generation, report.clone(), login.clone())
+                })
+                .collect()
+        };
+        let mut outage = false;
+        for (harness, generation, report, login) in reports {
+            let current = self.login_of(&harness);
+            if login.is_some() && current.is_none() {
+                continue;
+            }
+            let stale = login.is_some() && login != current;
+            if stale {
+                self.plan.lock().unwrap().sent.remove(&harness);
+            } else {
+                outage = matches!(
+                    api.post("limit", &report).await,
+                    Err(super::history::ApiError::Network(_))
+                        | Err(super::history::ApiError::Status(429 | 500.., _))
+                );
+                if outage {
+                    break;
+                }
+            }
+            let mut plan = self.plan.lock().unwrap();
+            if plan
+                .reports
+                .get(&harness)
+                .is_some_and(|(newest, ..)| *newest == generation)
+            {
+                plan.reports.remove(&harness);
+                plan.save(&self.config.state_dir);
+            }
+        }
+        let mut retry = self.report_retry.lock().unwrap();
+        *retry = if outage {
+            let wait = (retry.1 * 2).clamp(10_000, 300_000);
+            (now + wait, wait)
+        } else {
+            (0, 0)
+        };
+    }
+
+    /// A drain gave up on sending: wait before trying again, like an outage.
+    pub fn delay_plan_reports(&self) {
+        let mut retry = self.report_retry.lock().unwrap();
+        let wait = (retry.1 * 2).clamp(10_000, 300_000);
+        *retry = (now_ms() + wait, wait);
+    }
+
     async fn sync_resume_loops(&self) {
         let Some(api) = &self.history.api else {
             return;
         };
+        self.send_plan_reports().await;
         let now = now_ms();
         let changes: Vec<_> = self
             .local
@@ -353,6 +710,8 @@ impl Manager {
             .import(&self.config, &self.storage, credentials)
             .await;
         if self.codex_auth.take_switched().await {
+            self.codex_login_changed();
+            self.apply_codex_status(&status);
             self.continue_limited(&[runtime::Kind::Codex, runtime::Kind::Pi]);
         }
         Ok(status)

@@ -173,7 +173,7 @@ class AgentHomeTests(unittest.TestCase):
                 (home / relative).mkdir(parents=True, exist_ok=True)
             for relative in ('.codex/auth.json', '.pi/agent/auth.json'):
                 (home / relative).write_text(home.name + '-synthetic-login')
-        for name in ('os.chown', 'os.fchown'):
+        for name in ('os.chown', 'os.fchown', 'os.setgroups', 'os.setegid', 'os.seteuid'):
             p = patch(name); p.start(); self.addCleanup(p.stop)
         p = patch.object(self.setup, 'shell_agents', return_value=[])
         self.processes = p.start(); self.addCleanup(p.stop)

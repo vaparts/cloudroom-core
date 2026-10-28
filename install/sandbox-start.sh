@@ -47,7 +47,9 @@ supervise() {
   if [ -z "$container" ]; then
     echo $$ > "$cgroup/cgroup.procs"
     chown -R cloudroom:cloudroom "$cgroup"
-    identity+=(--inh-caps="$caps" --ambient-caps="$caps" --bounding-set="$caps")
+    # Core gets only these capabilities. The bounding set stays whole: agents inherit it, and their sudo
+    # must be full root inside their own sandbox (docs/scopes/sandboxes.md), or apt cannot chown.
+    identity+=(--inh-caps="$caps" --ambient-caps="$caps")
   fi
   # Containers may not allow raising the hard limit.
   ulimit -n 524288 2>/dev/null || ulimit -n "$(ulimit -Hn)"

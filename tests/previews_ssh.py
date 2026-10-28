@@ -18,6 +18,9 @@ import time
 import urllib.error
 import urllib.request
 
+# CI points this at the optimized build it ships (ADR 0296).
+BINARY = Path(os.environ.get('CLOUDROOM_BIN') or Path(__file__).resolve().parents[1] / 'target/debug/cloudroom')
+
 
 def run(*args, **kwargs):
     return subprocess.check_output(args, text=True, stderr=subprocess.PIPE, timeout=20, **kwargs).strip()
@@ -79,7 +82,7 @@ def main():
         state.mkdir(mode=0o700); os.chown(state, service.pw_uid, service.pw_gid)
         (root / 'bin').mkdir(mode=0o755)
         binary = root / 'bin/cloudroom'
-        shutil.copyfile(source / 'target/debug/cloudroom', binary); binary.chmod(0o755)
+        shutil.copyfile(BINARY, binary); binary.chmod(0o755)
         assert 1000 not in (service.pw_uid, agent.pw_uid)
         os.chown(binary.parent, 1000, 0)  # Reproduce provider-owned /usr/local/lib without changing it.
         Path('/run/sshd').mkdir(exist_ok=True)

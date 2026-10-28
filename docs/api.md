@@ -44,7 +44,7 @@ Commands, all `POST /v1/sessions/{id}/...` with a `request_id`:
 - `sleep`: release an idle harness process. The next message wakes it.
 - `compact`: ask the harness to compact its context.
 - `rewind`: go back to an earlier message (`before` or `last_turn_id`), with an optional `replacement` prompt.
-- `attachments?request_id=ID&name=NAME&kind=image|file`: upload a raw file body (images up to 10 MiB, files up to 25 MiB).
+- `attachments?request_id=ID&name=NAME&kind=image|file`: upload a raw file body (images up to 10 MiB, files up to 100 MiB).
   With `upload_parts`, add `&offset=N&total=SIZE` to send it in parts of at most 8 MiB (clients use 4 MiB, since some sandbox proxies drop requests over about 8 MB). Earlier parts return `{"received":N}`; the last returns the receipt. Repeated parts are ignored, gaps refused, and unfinished uploads expire after 10 minutes.
 - `close`: end the session and keep its history.
 

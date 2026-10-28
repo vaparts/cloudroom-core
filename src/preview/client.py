@@ -4,7 +4,6 @@ import argparse
 import base64
 import concurrent.futures
 import contextlib
-import fcntl
 import http.client
 import hashlib
 import http.server
@@ -14,7 +13,6 @@ import json
 import os
 from pathlib import Path
 import plistlib
-import pwd
 import random
 import select
 import shlex
@@ -30,22 +28,42 @@ import urllib.parse
 import urllib.request
 import uuid
 
+WINDOWS = sys.platform == 'win32'
+if WINDOWS:
+    import msvcrt
+else:
+    import fcntl
+    import pwd
+# Windows files have no owner IDs or mode bits; the user's profile folder ACL keeps this folder private there.
+NOFOLLOW = getattr(os, 'O_NOFOLLOW', 0)
+
 
 def private_json(path):
-    fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    fd = os.open(path, os.O_RDONLY | NOFOLLOW)
     with os.fdopen(fd) as file:
         info = os.fstat(file.fileno())
-        if info.st_uid != os.getuid() or info.st_mode & 0o077:
+        if not WINDOWS and (info.st_uid != os.getuid() or info.st_mode & 0o077):
             raise ValueError('Preview configuration must be private and owned by this user')
         return json.load(file)
 
 
 def save(path, value):
     temporary = path.with_suffix('.pending')
-    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_NOFOLLOW, 0o600)
+    fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | NOFOLLOW, 0o600)
     with os.fdopen(fd, 'w') as file:
         json.dump(value, file); file.flush(); os.fsync(file.fileno())
     temporary.replace(path)
+
+
+def exclusive(file):
+    """Locks `file` for this process, or raises BlockingIOError while another process holds it."""
+    if not WINDOWS:
+        return fcntl.flock(file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    file.seek(0)
+    try:
+        msvcrt.locking(file.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        raise BlockingIOError('Locked by another process') from None
 
 
 class NoRedirect(urllib.request.HTTPRedirectHandler):
@@ -159,6 +177,7 @@ PROBLEMS, ISSUERS = {}, {}
 # Show only problems that outlast the next minute's check: by then a sandbox that fell asleep has left the list,
 # and a short network drop has passed. Never ask the website more often (db-load-budget).
 PROBLEM_SECONDS = AWAKE_SECONDS + 15
+HERE = 'this PC' if WINDOWS else 'this Mac'
 
 
 def cause(error):
@@ -184,16 +203,16 @@ def describe(step, error, url):
         message = 'Sign out of Cloudroom and sign in again.' if code == 401 else "Cloudroom didn't answer as expected. This is usually temporary."
         detail += f' HTTP {code}'
     elif isinstance(reason, ssl.SSLCertVerificationError):
-        message = 'A VPN, proxy, or antivirus on this Mac may be intercepting secure connections.'
+        message = f'A VPN, proxy, or antivirus on {HERE} may be intercepting secure connections.'
         detail += f' {reason.verify_code} {reason.verify_message}' + (f'; {issuer(url)}' if step == 'list' else '')
     elif isinstance(reason, socket.gaierror):
-        message = "This Mac can't look up Cloudroom. Check the internet connection or VPN."
+        message = f"{HERE[0].upper() + HERE[1:]} can't look up Cloudroom. Check the internet connection or VPN."
         detail += ' ' + str(reason)[:100]
     elif unsent(error):
-        message = 'A firewall, VPN, or proxy on this Mac may be blocking Cloudroom.'
+        message = f'A firewall, VPN, or proxy on {HERE} may be blocking Cloudroom.'
         detail += ' ' + str(reason)[:100]
     elif isinstance(reason, (OSError, http.client.HTTPException)):  # A drop, timeout, or garbled answer may be our side too.
-        message = "The connection to Cloudroom keeps failing. It may be this Mac's network, or a temporary problem."
+        message = f"The connection to Cloudroom keeps failing. It may be {HERE}'s network, or a temporary problem."
         detail += ' ' + str(reason)[:100]
     else:
         message = "Cloudroom didn't answer as expected. This is usually temporary."
@@ -292,9 +311,16 @@ class Upstream(http.client.HTTPConnection):
         self.path = path
 
     def connect(self):
-        self.sock = socket.socket(socket.AF_UNIX)
-        self.sock.settimeout(self.timeout)
-        self.sock.connect(str(self.path))
+        if WINDOWS:
+            relay = RELAYS.get(self.path)
+            if relay is None:
+                raise ConnectionRefusedError('Preview tunnel closed')
+            self.sock = relay.client()
+            self.sock.settimeout(self.timeout)
+        else:
+            self.sock = socket.socket(socket.AF_UNIX)
+            self.sock.settimeout(self.timeout)
+            self.sock.connect(str(self.path))
         self.transport = self.sock
 
 
@@ -415,12 +441,33 @@ class Proxy(http.server.BaseHTTPRequestHandler):
 
 class Server(http.server.ThreadingHTTPServer):
     daemon_threads = True
-    allow_reuse_address = True
+    # Windows lets a second program bind a port in use: always with SO_REUSEADDR, and on 127.0.0.1 over another program's
+    # 0.0.0.0 or :: listener. Either would take over the user's own local server, so a port that answers counts as taken.
+    allow_reuse_address = not WINDOWS
+
+    def server_bind(self):
+        if WINDOWS:
+            port = self.server_address[1]
+            with socket.socket() as probe:
+                probe.settimeout(.5)
+                if port and probe.connect_ex(('127.0.0.1', port)) == 0:
+                    raise OSError(f'Port {port} is in use by another program')
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def get_request(self):
         connection, address = super().get_request()
         connection.settimeout(15)
         return connection, address
+
+
+# Windows' Python has no Unix sockets, so there each relay is found by its tunnel's socket path and hands out socket pairs.
+RELAYS = {}
+
+
+def reachable(path):
+    """The tunnel's local end is there: its Unix socket, or on Windows its relay."""
+    return path in RELAYS if WINDOWS else path.exists()
 
 
 class Relay:
@@ -429,6 +476,10 @@ class Relay:
     def __init__(self, core, port, device, path):
         self.core, self.port, self.device, self.stopped = core, port, device, False
         self.stderr = io.BytesIO()
+        self.path, self.listener = path, None
+        if WINDOWS:
+            RELAYS[path] = self
+            return
         self.listener = socket.socket(socket.AF_UNIX)
         self.listener.bind(str(path)); os.chmod(path, 0o600); self.listener.listen(32)
         threading.Thread(target=self.serve, daemon=True).start()
@@ -440,6 +491,11 @@ class Relay:
             except OSError:
                 return
             threading.Thread(target=self.pipe, args=(client,), daemon=True).start()
+
+    def client(self):
+        local, relayed = socket.socketpair()
+        threading.Thread(target=self.pipe, args=(relayed,), daemon=True).start()
+        return local
 
     def open(self):
         # Some sandbox proxies relay bytes only after a WebSocket handshake; cores before 0.1.35 know only cloudroom-tunnel.
@@ -494,7 +550,8 @@ class Relay:
 
     def terminate(self):
         self.stopped = True
-        with contextlib.suppress(OSError):
+        RELAYS.pop(self.path, None)
+        with contextlib.suppress(OSError, AttributeError):
             self.listener.close()
     kill = terminate
 
@@ -522,6 +579,8 @@ class Tunnel:
         self.listen(port, device, local_port)
 
     def ssh(self, folder, port, metadata, allow_private):
+        if WINDOWS:
+            raise OSError('SSH previews (VMs) need macOS or Linux')
         address = ipaddress.ip_address(metadata['host'])
         if not address.is_global and not allow_private:
             raise ValueError('Private SSH addresses require explicit self-hosted setup')
@@ -562,7 +621,7 @@ class Tunnel:
             raise
 
     def healthy(self):
-        if self.process.poll() is not None or not self.socket_path.exists():
+        if self.process.poll() is not None or not reachable(self.socket_path):
             return False
         try:
             with contextlib.closing(http.client.HTTPConnection('127.0.0.1', self.server.server_port, timeout=10)) as connection:
@@ -593,9 +652,10 @@ def identity(folder):
     key = folder / 'id_ed25519'
     public = folder / 'id_ed25519.pub'
     if not key.exists() and not public.exists():
-        subprocess.run(['/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True, capture_output=True)
+        # Windows 10 and 11 include OpenSSH's ssh-keygen on PATH.
+        subprocess.run(['ssh-keygen' if WINDOWS else '/usr/bin/ssh-keygen', '-q', '-t', 'ed25519', '-N', '', '-f', str(key)], check=True, capture_output=True)
     info = key.lstat()
-    if key.is_symlink() or info.st_uid != os.getuid() or info.st_mode & 0o077 or public.is_symlink():
+    if key.is_symlink() or not WINDOWS and (info.st_uid != os.getuid() or info.st_mode & 0o077) or public.is_symlink():
         raise ValueError('Unsafe preview SSH key')
     return ' '.join(public.read_text().split()[:2])
 
@@ -603,7 +663,9 @@ def identity(folder):
 MAC_LIMIT = 16 * 1024 * 1024
 MAC_LEVELS = ('off', 'read-only', 'ask', 'full')
 # Read-only commands (ADR 0186): no file writes outside temp folders, no signals to other processes, and no tools that
-# drive apps or system settings. macOS also refuses setuid tools like ps and top here; pgrep and lsof still work.
+# drive apps or system settings. Beyond those named tools, they cannot run programs from the writable temp folders, open
+# apps or URLs through Launch Services, send Apple Events, create background jobs, or write preferences through cfprefsd.
+# macOS also refuses setuid tools like ps and top here; pgrep and lsof still work.
 # They also cannot reach this Mac's own servers and sockets (the app's local API, ssh-agent, Docker; DNS still works) or
 # read Cloudroom's folder beyond its tools, so they cannot act through the app or its tokens (ADR 0260). The internet works.
 READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
@@ -612,6 +674,11 @@ READ_ONLY = ('(version 1)(allow default)(deny file-write*)'
              '(deny signal (target others))'
              '(deny process-exec (literal "/usr/bin/osascript") (literal "/usr/bin/open") (literal "/usr/bin/shortcuts")'
              ' (literal "/usr/bin/automator") (literal "/bin/launchctl") (literal "/usr/bin/tccutil") (literal "/usr/bin/defaults"))'
+             '(deny process-exec (subpath "/private/tmp") (subpath "/private/var/folders"))'
+             # System services act outside this sandbox, so block the routes rather than only the tools that use them.
+             '(deny mach-lookup (global-name "com.apple.coreservices.launchservicesd") (global-name "com.apple.coreservices.appleevents")'
+             ' (global-name "com.apple.lsd.open") (global-name "com.apple.lsd.openurl") (global-name "com.apple.lsd.modifydb"))'
+             '(deny appleevent-send)(deny job-creation)(deny user-preference-write)'
              # Seatbelt's localhost misses IPv4-mapped IPv6 like ::ffff:127.0.0.1, so IPv6 is blocked outright and clients fall
              # back to IPv4. It must be ip4 here: next to an ip6 rule, (remote ip "localhost:*") stops matching 127.0.0.1.
              '(deny network-outbound (remote ip4 "localhost:*") (remote ip6 "*:*") (remote unix-socket))'
@@ -627,22 +694,58 @@ def read_only(data):
     return ['/usr/bin/sandbox-exec', *(arg for key, path in params.items() for arg in ('-D', f'{key}={path}')), '-p', READ_ONLY]
 ASK = '''on run argv
 activate
-display dialog (item 1 of argv) with title "Cloudroom" buttons {"Allow", "Allow for this thread", "Deny"} default button "Deny" cancel button "Deny" with icon caution giving up after 300
+display dialog (item 1 of argv) with title "Cloudroom" buttons {"Allow", "Allow for this sandbox", "Deny"} default button "Deny" cancel button "Deny" with icon caution giving up after 300
 return button returned of result
 end run'''
 
 
 def visible(text, chars, lines):
-    """The part of `text` the Ask first popup shows, and how many characters it leaves out."""
-    text = text.rstrip()
-    shown = ''.join(text[:chars].splitlines(keepends=True)[:lines]).rstrip()
-    return shown, len(text) - len(shown)
+    """The part of an agent's text the Ask first popup shows, and how many characters it leaves out. Characters the
+    popup could hide or show as something else, like \\r or a right-to-left mark, show as escapes such as \\u202e.
+    Only \\n breaks lines, and with `lines` at 1 it is escaped too."""
+    shown, keep = [], '\n' if lines > 1 else ''
+    for c in text:
+        c = c if c.isprintable() or c in keep else c.encode('unicode_escape').decode()
+        lines, chars = lines - (c == '\n'), chars - len(c)
+        if chars < 0 or not lines:
+            break
+        shown.append(c)
+    return ''.join(shown), len(text) - len(shown)
+
+
+def block(text):
+    """Agent text under its label in the Ask first popup: its lines are indented, and the popup's own lines are not."""
+    return '    ' + text.replace('\n', '\n    ')
 
 
 # Hex characters per result request: some sandbox proxies drop requests over about 8 MB,
 # and each part must upload within MAC_POST_SECONDS on a slow home connection.
 MAC_PART = 1024 * 1024
 MAC_POST_SECONDS = 60
+# New per helper process: when it changes, Core ends jobs the old process was running (#569).
+MAC_BOOT = uuid.uuid4().hex
+
+
+def mac_stdin(core, device, job):
+    """A job's input, downloaded after confirming it, so a big push never holds up other jobs on the stream (#576).
+    Older cores send it inside the job instead. None if it can't be downloaded."""
+    size = job.get('stdin_bytes')
+    if not size:
+        return job.get('stdin') or ''
+    url = core.url + '/v1/mac/jobs/' + urllib.parse.quote(job['id']) + '/stdin?device=' + urllib.parse.quote(device)
+    for _ in range(3):
+        try:
+            with NET['opener'].open(urllib.request.Request(url, headers=core.headers), timeout=MAC_POST_SECONDS) as response:
+                data = response.read(size + 1)
+            if len(data) == size:
+                return data.hex()
+        except urllib.error.HTTPError as error:
+            error.close()
+            return None  # Core already gave up on this job.
+        except (OSError, http.client.HTTPException):
+            pass
+        time.sleep(1)
+    return None
 
 
 def mac_level(config):
@@ -668,7 +771,7 @@ def script_of(job):
     return None
 
 
-def review(core, job, level):
+def review(core, job, level, script):
     account, token = (core.connection.get('account') or {}).get('id'), core.connection.get('sandboxToken')
     key, now = (core.url, job.get('command')), time.monotonic()
     with REVIEWS['lock']:
@@ -683,8 +786,9 @@ def review(core, job, level):
         try:
             credential = base64.b64encode((account + ':' + token).encode()).decode()
             body = {'command': job['command'][:8000], 'cwd': job.get('cwd'), 'write': bool(job.get('write')), 'level': level, 'thread': core.thread}
-            with contextlib.suppress(OSError, ValueError):
-                body['script'] = script_of(job)
+            if script:
+                with contextlib.suppress(OSError, ValueError):
+                    body['script'] = script_of(job)
             control(website(core.config, core.connection) + '/api/desktop/mac-reviews', body, 'POST', {'Authorization': 'Basic ' + credential})
         except (OSError, ValueError, KeyError, TypeError):
             pass
@@ -713,8 +817,9 @@ class MacJobs:
         self.folder, self.running, self.lock = folder, {}, threading.Lock()
         # Jobs the agent stopped before they started; execute skips them.
         self.cancelled = set()
-        # Ask first: one dialog at a time; "Allow for this thread" trusts that sandbox's core until the helper restarts.
-        self.asking, self.trusted = threading.Lock(), set()
+        # Ask first: one dialog at a time. "Allow for this sandbox" trusts every agent on that sandbox's core (jobs carry no
+        # thread), until the helper restarts or the access level changes.
+        self.asking, self.trusted, self.level = threading.Lock(), set(), None
 
     def enabled(self):
         config = private_json(self.folder / 'config.json')
@@ -725,18 +830,20 @@ class MacJobs:
             if core.key in self.trusted:
                 return True
             # Show what will run, including a script sent as input. Hidden parts still run: warn above them, where
-            # padding cannot push the warning out of view. Return always denies.
-            command, hidden = visible(job['command'], 600, 10)
+            # padding cannot push the warning out of view. The command comes first, and the folder after it on one
+            # line, so a folder name cannot pose as the command. Return always denies.
+            command, hidden = visible(job['command'].rstrip(), 600, 10)
             warnings = f"Warning: {hidden:,} more characters of this command are not shown, and will also run.\n\n" if hidden else ''
-            text = f"Folder: {job.get('cwd') or '~'}\nCommand: {command}"
+            folder, cut = visible(job.get('cwd') or '~', 200, 1)
+            text = f"Command:\n{block(command)}\n\nFolder: {folder}{'…' if cut else ''}"
             if job.get('stdin'):
                 try:
-                    data = bytes.fromhex(job['stdin']).decode()
+                    data = bytes.fromhex(job['stdin']).decode().rstrip()
                     if '\0' in data:
                         raise ValueError('binary input')
                     script, hidden = visible(data, 1000, 20)
-                    count = len(data.rstrip().splitlines())
-                    text += f"\n\nInput ({count:,} line{'s' if count != 1 else ''}{', all shown' if not hidden else ''}):\n\n{script}"
+                    count = data.count('\n') + 1
+                    text += f"\n\nInput ({count:,} line{'s' if count != 1 else ''}{', all shown' if not hidden else ''}):\n{block(script)}"
                     if hidden:
                         warnings += f"Warning: {hidden:,} more characters of its input are not shown, and will also run.\n\n"
                 except ValueError:  # Not text, such as the archive a push unpacks.
@@ -749,13 +856,19 @@ class MacJobs:
             answer = process.communicate()[0].strip()
             with self.lock:
                 self.running.pop(job['id'], None)
-            if answer == 'Allow for this thread':
+            if answer == 'Allow for this sandbox':
                 self.trusted.add(core.key)
-            return answer in ('Allow', 'Allow for this thread')
+            return answer in ('Allow', 'Allow for this sandbox')
+
+    def track(self, level):
+        """Any access level change, even Off and back, ends "Allow for this sandbox"."""
+        if level != self.level:
+            self.trusted, self.level = set(), level
 
     def refusal(self, core, job):
         """Why this job may not run as asked, or None. Everything else that is not full access runs read-only."""
         level = mac_level(self.enabled() or {})
+        self.track(level)
         if level == 'off':
             return 'Mac access is off.'
         if level == 'full' or not job.get('write') and sys.platform == 'darwin' and level in ('read-only', 'ask'):
@@ -774,6 +887,7 @@ class MacJobs:
         while True:
             with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
                 config = self.enabled()
+                self.track(mac_level(config or {}))
                 listed = {core.key: core for core in cores(config)} if config else {}
                 self.wanted = set(listed)
                 for key, core in listed.items():
@@ -786,7 +900,7 @@ class MacJobs:
         delay = 2
         while core.key in self.wanted:
             try:
-                request = urllib.request.Request(core.url + '/v1/mac/jobs?device=' + device,
+                request = urllib.request.Request(core.url + '/v1/mac/jobs?device=' + device + '&boot=' + MAC_BOOT + '&fetch=true',
                                                  headers={**core.headers, 'Accept': 'text/event-stream'})
                 with NET['opener'].open(request, timeout=60) as stream:
                     delay, event = 2, None
@@ -814,8 +928,6 @@ class MacJobs:
         def post(body, timeout=MAC_POST_SECONDS):
             core.fetch(core.url + '/v1/mac/results/' + urllib.parse.quote(job['id']), {'device': device, **body}, None, core.headers,
                        timeout)
-        with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
-            review(core, job, mac_level(self.enabled() or {}))
         # Run only once Core confirms it still wants the job. Core gives up on an unconfirmed job after about 10 s and tells
         # the agent it did not run, so running it anyway could change the Mac twice when the agent retries.
         confirmed, deadline = False, time.monotonic() + 30
@@ -831,7 +943,13 @@ class MacJobs:
                 time.sleep(1)
         result = {'state': 'done', 'code': 127, 'stdout': '', 'stderr': '', 'truncated': False}
         # Core may have taken a confirmation whose reply was lost, so it still gets this result instead of waiting forever.
-        refused = self.refusal(core, job) if confirmed else 'The Mac could not confirm this command with the cloud, so it did not run. Try again.'
+        job['stdin'] = mac_stdin(core, device, job) if confirmed else ''
+        refused = ('The Mac could not confirm this command with the cloud, so it did not run. Try again.' if not confirmed else
+                   "The Mac could not download this command's input from the cloud, so it did not run. Try again." if job['stdin'] is None else
+                   self.refusal(core, job))
+        # Refused commands are checked too, but a script file is read only for a command that will run.
+        with contextlib.suppress(OSError, ValueError, KeyError, TypeError):
+            review(core, job, mac_level(self.enabled() or {}), not refused)
         sandboxed = not refused and not job.get('write') and mac_level(self.enabled() or {}) != 'full'
         login = pwd.getpwuid(os.getuid()).pw_shell or '/bin/zsh'
         # Cloudroom's own tools (browser-harness) come first, as in Local threads, after the user's profile sets PATH.
@@ -918,9 +1036,13 @@ def run(folder):
     def stop(*_):
         raise KeyboardInterrupt()
     signal.signal(signal.SIGTERM, stop)
-    threading.Thread(target=MacJobs(folder).serve, daemon=True).start()
+    if not WINDOWS:  # Mac access is macOS and Linux only (macAccessSupported).
+        threading.Thread(target=MacJobs(folder).serve, daemon=True).start()
     with (folder / 'lock').open('a') as lock:
-        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        if WINDOWS:
+            claim(folder, lock)
+        else:
+            exclusive(lock)
         try:
             while True:
                 try:
@@ -997,7 +1119,7 @@ def run(folder):
                         if not ready:
                             if tunnel.process.poll() is not None:
                                 error = 'Tunnel unavailable' if tunnel.relay else 'SSH connection unavailable'
-                            elif tunnel.socket_path.exists():
+                            elif reachable(tunnel.socket_path):
                                 error = 'Cloud HTTP server unavailable'
                         try:
                             tunnel.core.request('/report', {'device': config['device'], 'port': tunnel.port, 'generation': tunnel.generation,
@@ -1070,9 +1192,101 @@ LAUNCHER = ("const e={...process.env};delete e.ELECTRON_RUN_AS_NODE;"
             "for(const s of['SIGTERM','SIGINT','SIGHUP'])process.on(s,()=>c.kill(s));c.on('exit',code=>process.exit(code??1))")
 
 
+def running(folder):
+    """Whether a helper holds this folder's lock."""
+    with (folder / 'lock').open('a') as lock:
+        try:
+            exclusive(lock)
+        except BlockingIOError:
+            return True
+        lock.seek(0)
+        msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+        return False
+
+
+def claim(folder, lock):
+    """Windows: take the folder's lock (a running() check may hold it for a moment), drop an old stop request, confirm the
+    start to the launcher, and exit as soon as a stop request arrives."""
+    deadline = time.monotonic() + 5
+    while True:
+        try:
+            exclusive(lock)
+            break
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                raise
+            time.sleep(.05)
+    (folder / 'stop').unlink(missing_ok=True)
+    if os.environ.get('CLOUDROOM_PREVIEW_START'):
+        (folder / 'started').write_text(os.environ['CLOUDROOM_PREVIEW_START'])
+    def watch():
+        while not (folder / 'stop').exists():
+            time.sleep(.2)
+        os._exit(0)
+    threading.Thread(target=watch, daemon=True).start()
+
+
+@contextlib.contextmanager
+def serialized(folder):
+    """Windows: one start or stop at a time."""
+    with (folder / 'control.lock').open('a') as lock:
+        deadline = time.monotonic() + 30
+        while True:
+            try:
+                exclusive(lock)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise OSError('Another preview start or stop is still running')
+                time.sleep(.1)
+        try:
+            yield
+        finally:
+            lock.seek(0)
+            msvcrt.locking(lock.fileno(), msvcrt.LK_UNLCK, 1)
+
+
+def windows(folder, stop):
+    """Windows has no launchd: a detached helper runs until sign-out or logoff, and each app launch restarts it. A start
+    waits for the helper to confirm; a stop asks it to exit. Nothing is ended by a process id read from a file."""
+    with serialized(folder):
+        if stop:
+            if running(folder):
+                (folder / 'stop').write_text('')
+            deadline = time.monotonic() + 10
+            while running(folder):
+                if time.monotonic() >= deadline:
+                    raise OSError('Preview helper did not stop')
+                time.sleep(.1)
+            return
+        start = uuid.uuid4().hex
+        (folder / 'started').unlink(missing_ok=True)
+        command = [sys.executable, '-B', '-E', '-s', str(folder / 'client.py'), 'run', str(folder)]
+        flags = subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+        for extra in (subprocess.CREATE_BREAKAWAY_FROM_JOB, 0):  # Outlive the app's job object when it allows that.
+            try:
+                process = subprocess.Popen(command, creationflags=flags | extra, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                                           stderr=subprocess.DEVNULL, close_fds=True, env={**os.environ, 'CLOUDROOM_PREVIEW_START': start})
+                break
+            except OSError:
+                if not extra:
+                    raise
+        deadline = time.monotonic() + 15
+        while True:
+            with contextlib.suppress(OSError):
+                if (folder / 'started').read_text() == start:
+                    return
+            if process.poll() is not None or time.monotonic() >= deadline:
+                process.kill()  # Our own child's handle, never a stale id: a helper that missed its start never runs late.
+                raise OSError('Preview helper did not start')
+            time.sleep(.1)
+
+
 def launch(folder, stop=False):
     if sys.platform.startswith('linux'):
         return systemd(folder, label(folder), stop)
+    if WINDOWS:
+        return windows(folder, stop)
     if sys.platform != 'darwin':
         raise ValueError('Use run for foreground helpers outside macOS and Linux')
     name = label(folder)
@@ -1088,7 +1302,7 @@ def launch(folder, stop=False):
         with (folder / 'lock').open('a') as lock:
             while True:
                 try:
-                    fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    exclusive(lock)
                     break
                 except BlockingIOError:
                     if time.monotonic() >= deadline:
@@ -1131,10 +1345,13 @@ def configure(folder, connection_file, activate, allow_private, mac_access=None,
             and old.get('allowPrivateSsh', False) == allow_private and old.get('macAccess') == mac_access
             and old.get('launcher') == launcher and old.get('binary') == binary and old.get('ownThreads', False) == own
             and old.get('website') == trusted and target.is_file() and target.read_bytes() == source.read_bytes()):
-        check = ['systemctl', '--user', 'is-active', '--quiet', label(folder) + '.service'] if sys.platform.startswith('linux') else ['launchctl', 'print', f'gui/{os.getuid()}/' + label(folder)]
-        active = subprocess.run(check, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-        if active.returncode == 0:
-            return {'enabled': True}
+        if WINDOWS:
+            if running(folder):
+                return {'enabled': True}
+        else:
+            check = ['systemctl', '--user', 'is-active', '--quiet', label(folder) + '.service'] if sys.platform.startswith('linux') else ['launchctl', 'print', f'gui/{os.getuid()}/' + label(folder)]
+            if subprocess.run(check, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0:
+                return {'enabled': True}
     if activate:
         launch(folder, stop=True)
     if source != target:

@@ -160,6 +160,8 @@ impl Manager {
                     harness["provider_selection"] = json!(false);
                     // fx switches effort per turn; the others keep the launch level.
                     if *kind == runtime::Kind::Fx {
+                        harness["reasoning_levels"] =
+                            json!([runtime::PI_REASONING_LEVELS, &["max"]].concat());
                         harness["prompt_reasoning"] = json!(true);
                     }
                     if *kind == runtime::Kind::Cursor {
@@ -228,8 +230,7 @@ impl Manager {
                 let selected = model.ok_or(Error::Conflict("invalid model"))?;
                 self.reasoning_supported(kind, &selected, reasoning).await?
             }
-            runtime::Kind::Pi => runtime::pi_reasoning_accepted(reasoning),
-            runtime::Kind::Fx => runtime::PI_REASONING_LEVELS.contains(&reasoning),
+            runtime::Kind::Pi | runtime::Kind::Fx => runtime::pi_reasoning_accepted(reasoning),
             runtime::Kind::OpenCode => runtime::OPENCODE_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::Hermes => runtime::HERMES_REASONING_LEVELS.contains(&reasoning),
             runtime::Kind::Devin => runtime::DEVIN_REASONING_LEVELS.contains(&reasoning),

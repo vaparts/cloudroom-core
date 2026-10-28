@@ -15,6 +15,8 @@ from urllib.parse import urlencode
 
 assert sys.platform == 'linux' and os.geteuid() == 0 and Path('/.dockerenv').exists() and sys.argv[1:] == ['--disposable'], 'disposable Linux container only'
 CORE = Path(__file__).resolve().parents[1]
+# CI points this at the optimized build it ships (ADR 0296).
+BINARY = Path(os.environ.get('CLOUDROOM_BIN') or CORE / 'target/debug/cloudroom')
 BASE = Path('/var/lib/cloudroom-disk-probe')
 TOOLS = Path('/opt/cloudroom-disk-probe')
 checks = {}
@@ -65,7 +67,7 @@ def seed(name):
 def start(env,name):
     global process,log,address
     path=BASE/(name+'.log');log=path.open('w+')
-    process=subprocess.Popen([str(CORE/'target/debug/cloudroom')],env=env,stdout=log,stderr=log)
+    process=subprocess.Popen([str(BINARY)],env=env,stdout=log,stderr=log)
     until=time.monotonic()+10
     while time.monotonic()<until:
         text=path.read_text()

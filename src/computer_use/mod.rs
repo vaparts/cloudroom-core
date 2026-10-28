@@ -29,6 +29,7 @@ pub const SKILL: &str = include_str!("SKILL.md");
 const DRIVER: &str = "/usr/local/lib/cloudroom/cua-driver/cua-driver";
 const DISPLAY: &str = ":99";
 const X_SOCKET: &str = "/tmp/.X11-unix/X99";
+const X_LOCK: &str = "/tmp/.X99-lock";
 const STATE: &str = "/tmp/cloudroom-computer-use";
 // Cua Driver colors a session ending in "-8" with its lime palette slot, our brand color.
 const SESSION: &str = "cloudroom-8";
@@ -126,11 +127,14 @@ fn listening(path: &str) -> bool {
     UnixStream::connect(path).is_ok()
 }
 
-fn alive(pid_file: &str) -> bool {
+/// Whether `pid_file` names a live process started as `program`. A resume keeps /tmp but not processes, so a saved
+/// PID can belong to another process by then; a zombie's command line is empty.
+fn alive(pid_file: &str, program: &str) -> bool {
     std::fs::read_to_string(pid_file)
         .ok()
         .and_then(|pid| pid.trim().parse::<u32>().ok())
-        .is_some_and(|pid| Path::new(&format!("/proc/{pid}")).exists())
+        .and_then(|pid| std::fs::read(format!("/proc/{pid}/cmdline")).ok())
+        .is_some_and(|cmdline| cmdline.split(|&byte| byte == 0).next() == Some(program.as_bytes()))
 }
 
 /// Starts the virtual screen, the accessibility bus and the driver, once.
@@ -140,7 +144,15 @@ fn ensure_desktop() -> Result<String, Error> {
     }
     std::fs::create_dir_all(STATE)?;
     std::fs::set_permissions(STATE, std::os::unix::fs::PermissionsExt::from_mode(0o700))?;
+    // One command at a time: a second one waits here, then finds everything running.
+    let lock = std::fs::File::create(format!("{STATE}/desktop.lock"))?;
+    lock.lock()?;
     if !listening(X_SOCKET) {
+        // Xvfb won't start while its old lock names a live process.
+        if !alive(X_LOCK, "Xvfb") {
+            let _ = std::fs::remove_file(X_LOCK);
+            let _ = std::fs::remove_file(X_SOCKET);
+        }
         detach(
             "Xvfb",
             &[DISPLAY, "-screen", "0", "1440x900x24", "-nolisten", "tcp"],
@@ -165,16 +177,13 @@ fn ensure_desktop() -> Result<String, Error> {
     }
     // A window manager gives windows focus, so keyboard input reaches them (web/computer-use.sh installs it).
     let wm = format!("{STATE}/wm.pid");
-    if Path::new("/usr/bin/openbox").exists() && !alive(&wm) {
+    if Path::new("/usr/bin/openbox").exists() && !alive(&wm, "openbox") {
         std::fs::write(&wm, detach("openbox", &[], "wm")?.to_string())?;
     }
     let atspi = format!("{STATE}/atspi.pid");
-    if !alive(&atspi) {
-        let pid = detach(
-            "/usr/libexec/at-spi-bus-launcher",
-            &["--launch-immediately"],
-            "atspi",
-        )?;
+    let launcher = "/usr/libexec/at-spi-bus-launcher";
+    if !alive(&atspi, launcher) {
+        let pid = detach(launcher, &["--launch-immediately"], "atspi")?;
         std::fs::write(&atspi, pid.to_string())?;
     }
     let socket = format!("{STATE}/driver.sock");

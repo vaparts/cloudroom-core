@@ -601,6 +601,11 @@ impl Adapter for Protocol {
                         data: json!({"harness":"pi"}),
                         native: None,
                     });
+                    // Said like Claude's and Codex's, so a loop at the limit waits instead of failing (ADR 0292).
+                    self.error = self
+                        .error
+                        .take()
+                        .map(|said| super::plan_limit_error("Pi", None, &said));
                 }
                 s.status = match v["message"]["stopReason"].as_str() {
                     Some("aborted") => "interrupted",

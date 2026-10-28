@@ -123,8 +123,8 @@ class WorkspaceTests(unittest.TestCase):
             saved = part(2*size)['receipt']['input']
             self.assertEqual(Path(saved['path']).read_bytes(),big)
             self.assertEqual(part(2*size)['receipt']['input'],saved)
-            self.assertEqual(upload(kind,'parts-large','big.bin',b'x',expected=409,parts=f'&offset=0&total={25*1024**2+1}')['code'],'attachment_too_large')
-            for media,limit in [('image',10*1024**2),('file',25*1024**2)]:
+            self.assertEqual(upload(kind,'parts-large','big.bin',b'x',expected=409,parts=f'&offset=0&total={100*1024**2+1}')['code'],'attachment_too_large')
+            for media,limit in [('image',10*1024**2),('file',100*1024**2)]:
                 too_large = upload(kind,'large-'+media,'large',b'x'*(limit+1),media,409)
                 self.assertEqual(too_large['code'],'attachment_too_large')
                 self.assertFalse((path/'.cloudroom/attachments'/('large-'+media)/'large').exists())
@@ -207,16 +207,20 @@ class WorkspaceTests(unittest.TestCase):
         root = self.state.resolve()/'code'; root.mkdir()
         outside = self.root.resolve()/'outside'; outside.mkdir()
         (outside/'keep').write_text('private')
-        (root/'escape').symlink_to(outside)
-        self.seed('escape',root/'escape')
-        # Preserve the lexical path so the no-follow directory walk must reject it.
-        pending = self.state/'workspaces/escape.pending'
-        pending.write_text(json.dumps({'id':'escape','path':str(root/'escape')}))
-        record = self.state/'00000000000000000001.record'
-        value=json.loads(record.read_text()); value['data']['workspace']['path']=str(root/'escape');record.write_text(json.dumps(value))
+        for key in ['escape', 'legacy']:
+            (root/key).symlink_to(outside)
+            self.seed(key,root/key)
+            # Preserve lexical paths so the no-follow directory walk must reject them.
+            lexical = str(root/key)
+            pending = self.state/f'workspaces/{key}.pending'
+            pending.write_text(json.dumps({'id':key,'path':lexical}))
+            record = next(path for path in self.state.glob('*.record')
+                          if json.loads(path.read_text()).get('data',{}).get('request_id') == key)
+            value=json.loads(record.read_text()); value['data']['workspace']['path']=lexical;record.write_text(json.dumps(value))
         (self.state/'snapshot.json').unlink(missing_ok=True)  # Core trusts its snapshot over edited old records.
         self.start()
-        until(lambda:self.service.session('cr_escape')['state']=='failed','invalid mapping',10)
+        for key in ['escape', 'legacy']:
+            until(lambda:self.service.session('cr_'+key)['state']=='failed','invalid mapping '+key,10)
         self.assertFalse((outside/'child').exists())
         self.assertEqual((outside/'keep').read_text(),'private')
         self.service.request('POST','/v1/sessions',{'request_id':'bad','workspace':'../outside'},409)

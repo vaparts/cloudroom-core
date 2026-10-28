@@ -73,6 +73,10 @@ pub struct Status {
     pub login_id: Option<String>,
     pub verification_url: Option<String>,
     pub user_code: Option<String>,
+    /// Codex only: past its plan limit, whether purchased credits keep it working, and when the plan comes back (ms).
+    /// Internal: reported to the website for loops (ADR 0292), never in the API.
+    #[serde(skip)]
+    pub limit: Option<(bool, Option<u64>)>,
 }
 impl Status {
     pub(super) fn new(state: &'static str, message: Option<&'static str>) -> Self {
@@ -84,6 +88,7 @@ impl Status {
             login_id: None,
             verification_url: None,
             user_code: None,
+            limit: None,
         }
     }
 }
@@ -253,6 +258,22 @@ impl Rpc {
         );
         status.email = account["email"].as_str().map(str::to_owned);
         status.plan = account["planType"].as_str().map(str::to_owned);
+        // Past the plan: real Codex sends the used-up window and its reset only here, not in a turn's updates.
+        let full: Vec<&Value> = ["primary", "secondary"]
+            .iter()
+            .map(|key| &limit[*key])
+            .filter(|w| w["usedPercent"].as_f64().is_some_and(|n| n >= 100.0))
+            .collect();
+        if !full.is_empty()
+            || !limit["rateLimitReachedType"].is_null()
+            || limits["ordinaryUsageAllowed"] == false
+        {
+            let resets = full.iter().filter_map(|w| w["resetsAt"].as_u64()).max();
+            status.limit = Some((
+                credits["hasCredits"] == true || credits["unlimited"] == true,
+                resets.map(|s| s * 1000),
+            ));
+        }
         Ok(status)
     }
 }
